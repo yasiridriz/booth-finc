@@ -4,16 +4,18 @@ import { v } from "convex/values";
 import Anthropic from "@anthropic-ai/sdk";
 import { classify, textOf } from "./vision";
 import { synthesizeCommentary } from "../lib/commentaryVoice";
+import { DEFAULT_LANG, DEFAULT_STYLE, STYLES, isLang, isStyle, personaPrompt, type Lang, type StyleId } from "./personas";
 
 const MODEL = "claude-haiku-5-5"; // writes the spoken line, where speed matters most
 const VISION_MODEL = "claude-sonnet-5-5"; // reads the frames; benched clearly better than Haiku for ~0.4s more
 const VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM";
 
+// Shared rules for event calls. The style and language come first from convex/personas.ts and set the voice.
 const PERSONA =
-  "You are an electric, hyped-up live football commentator. One or two punchy calls, max 20 words. Always bring energy: even a simple pass crackles with anticipation, attacks build to a roar, saves and goals explode with disbelief and joy. Use exclamations, rhythm and vivid verbs, and vary them so no two calls sound alike. React only to the supplied observation; never invent teams, scores or outcomes. Name a player only if the observation already names them; never guess a name. Refer to a team by its name from the match line, not by shirt colour (the kit colours in the match line tell you which colour is which team). Never mention what did not happen (no 'no shot', 'no goal'). Vary your wording. No stage directions or audio tags; delivery is added separately.";
+  "One or two punchy calls, max 20 words (a haiku style may use its own form). Use rhythm and vivid verbs, and vary them so no two calls sound alike. React only to the supplied observation; never invent teams, scores or outcomes. Name a player only if the observation already names them; never guess a name. Refer to a team by its name from the match line, not by shirt colour (the kit colours in the match line tell you which colour is which team). Never mention what did not happen (no 'no shot', 'no goal'). Vary your wording. No stage directions or audio tags; delivery is added separately.";
 
 // Big moments are always called. Minor ones only fill silence.
-const BIG = new Set(["goal", "shot", "save", "foul", "celebration"]);
+const BIG = new Set(["goal", "shot", "save", "foul", "celebration", "penalty", "handball", "card"]);
 const QUIET_MS = 10000;
 const REPEAT_MS = 20000;
 
@@ -46,10 +48,12 @@ export const latest = query({
 export const resetMatch = mutation({
   args: {},
   handler: async (ctx) => {
-    // Keep the pasted roster; forget the score and teams.
+    // Keep the pasted roster and the chosen commentator; forget the score and teams.
     for await (const row of ctx.db.query("state")) await ctx.db.patch("state", row._id, { score: null, teams: undefined });
     for await (const row of ctx.db.query("lines")) await ctx.db.delete("lines", row._id);
     for await (const row of ctx.db.query("memory")) await ctx.db.delete("memory", row._id);
+    // Talking points belong to the clubs of the last match.
+    for await (const row of ctx.db.query("topics")) await ctx.db.delete("topics", row._id);
   },
 });
 
@@ -61,11 +65,47 @@ export const lastLine = internalQuery({
   },
 });
 
+export type MatchState = {
+  score: string | null;
+  teams: string | null;
+  roster: string | null;
+  style: StyleId;
+  lang: Lang;
+};
+
 export const getState = internalQuery({
   args: {},
-  handler: async (ctx): Promise<{ score: string | null; teams: string | null; roster: string | null }> => {
+  handler: async (ctx): Promise<MatchState> => {
     const row = await ctx.db.query("state").first();
-    return { score: row?.score ?? null, teams: row?.teams ?? null, roster: row?.roster ?? null };
+    return {
+      score: row?.score ?? null,
+      teams: row?.teams ?? null,
+      roster: row?.roster ?? null,
+      style: row?.style && isStyle(row.style) ? row.style : DEFAULT_STYLE,
+      lang: row?.lang && isLang(row.lang) ? row.lang : DEFAULT_LANG,
+    };
+  },
+});
+
+// The commentating style and language the host picked. Both survive "Reset match".
+export const persona = query({
+  args: {},
+  handler: async (ctx) => {
+    const row = await ctx.db.query("state").first();
+    return {
+      style: row?.style && isStyle(row.style) ? row.style : DEFAULT_STYLE,
+      lang: row?.lang && isLang(row.lang) ? row.lang : DEFAULT_LANG,
+    };
+  },
+});
+
+export const setPersona = mutation({
+  args: { style: v.string(), lang: v.string() },
+  handler: async (ctx, { style, lang }) => {
+    if (!isStyle(style) || !isLang(lang)) throw new Error("unknown style or language");
+    const row = await ctx.db.query("state").first();
+    if (row) await ctx.db.patch("state", row._id, { style, lang });
+    else await ctx.db.insert("state", { score: null, style, lang });
   },
 });
 
@@ -120,6 +160,8 @@ export const insertLine = internalMutation({
     audioUrl: v.optional(v.string()),
     priority: v.optional(v.number()),
     ttlMs: v.optional(v.number()),
+    vt: v.optional(v.number()),
+    madeMs: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     await ctx.db.insert("lines", args);
@@ -128,9 +170,11 @@ export const insertLine = internalMutation({
 
 // One frame in, at most one spoken line out.
 export const processFrame = action({
-  args: { frames: v.array(v.string()), hint: v.optional(v.string()) }, // base64 JPEGs, oldest first, no data: prefix
+  // frames: base64 JPEGs, oldest first, no data: prefix. vt: video time of the newest frame, when known.
+  args: { frames: v.array(v.string()), hint: v.optional(v.string()), vt: v.optional(v.number()) },
   returns: v.object({ event: v.string(), note: v.string(), score: v.union(v.string(), v.null()) }),
-  handler: async (ctx, { frames, hint }): Promise<{ event: string; note: string; score: string | null }> => {
+  handler: async (ctx, { frames, hint, vt }): Promise<{ event: string; note: string; score: string | null }> => {
+    const started = Date.now();
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_KEY });
 
     const t0 = Date.now();
@@ -179,7 +223,7 @@ export const processFrame = action({
       model: MODEL,
       max_tokens: 120,
       thinking: { type: "disabled" },
-      system: PERSONA,
+      system: `${personaPrompt(match.style, match.lang)}\n\nRules: ${PERSONA}`,
       messages: [
         {
           role: "user",
@@ -189,17 +233,19 @@ export const processFrame = action({
     });
     const text = textOf(speech.content);
 
-    const speechAudio = await synthesizeCommentary(text, event);
+    const speechAudio = await synthesizeCommentary(text, event, STYLES.find((s) => s.id === match.style)?.voiceId);
     const audioId = await ctx.storage.store(speechAudio.audio);
     const audioUrl = (await ctx.storage.getUrl(audioId)) ?? undefined;
 
     await ctx.runMutation(internal.booth.insertLine, {
-      persona: "commentator",
+      persona: `${match.style}:${match.lang}`,
       event,
       text,
       audioUrl,
       priority: 3,
       ttlMs: 9000,
+      vt,
+      madeMs: Date.now() - started,
     });
     if (event === "goal" || event === "shot" || event === "save" || event === "foul") {
       await ctx.runMutation(internal.memory.record, { kind: event, text: score ? `${note} (score ${score})` : note });

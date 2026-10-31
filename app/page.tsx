@@ -9,17 +9,22 @@ import { TeamSplitter, colourName, teamColour } from "@/lib/teams";
 import { GameState, describeRead, type Read, type Team } from "@/lib/game";
 import { BallWorker } from "@/lib/ballDetector";
 import { withOrt } from "@/lib/ortLock";
+import { BoothIcon } from "@/components/BoothIcon";
+import { CommentatorPicker } from "@/components/CommentatorPicker";
 
 const CLIP = "/clips/bashkimi-shkendija-10-20.mp4"; // local sample, no screen share needed
 const DEFAULT_CLUBS =
-  "KF Bashkimi Aračinovo (Macedonian First League), KF Shkëndija Tetovo (Macedonian First League)";
+  "Arsenal (London, Premier League), Tottenham Hotspur (London, Premier League)";
 const TOPIC_REFRESH_MS = 5 * 60 * 1000;
 const FILLER_CHECK_MS = 1500; // how often to ask whether a gap line is needed
-const DEFAULT_URL = "https://www.youtube.com/watch?v=91WI0e0Mf3c";
+const DEFAULT_URL = "https://www.youtube.com/watch?v=D29dNXViqJw";
 const DETECT_FPS = 5;
 const RING_SIZE = 4;
 const RING_GAP_MS = 500;
 const PITCH_EVERY_MS = 1000;
+const DELAY_S = 7; // broadcast delay: analysis runs this far ahead; calls measured at 5.0-6.4s to make
+const EARLY_S = 0.2; // a timed line may start this much before its moment
+const LATE_S = 2.5; // a timed line this late is stale and dropped
 
 function videoId(url: string) {
   return url.match(/(?:v=|youtu\.be\/|embed\/|live\/)([\w-]{11})/)?.[1] ?? null;
@@ -28,8 +33,11 @@ function videoId(url: string) {
 export default function Host() {
   const [url, setUrl] = useState(DEFAULT_URL);
   const [capturing, setCapturing] = useState(false);
-  const [source, setSource] = useState<"clip" | "youtube">("clip");
-  const clipVideo = useRef<HTMLVideoElement>(null);
+  const [source, setSource] = useState<"link" | "clip" | "youtube">("link");
+  // Link and clip modes read frames straight from a <video>; only YouTube mode needs tab capture.
+  const fromVideo = source !== "youtube";
+  const clipVideo = useRef<HTMLVideoElement>(null); // analysis copy; in link mode it runs DELAY_S ahead
+  const viewerVideo = useRef<HTMLVideoElement>(null); // what the viewer watches in link mode
   const [stats, setStats] = useState({
     players: 0,
     ball: "-",
@@ -90,7 +98,7 @@ export default function Host() {
   const audioPlaying = useRef(false);
   const current = useRef<HTMLAudioElement | null>(null);
   const queue = useRef<
-    { url: string; priority: number; ttl: number; seenAt: number }[]
+    { url: string; priority: number; ttl: number; seenAt: number; vt?: number }[]
   >([]);
   const seenLines = useRef<Set<string> | null>(null);
   const lastRead = useRef<{ text: string; t: number } | null>(null);
@@ -110,7 +118,7 @@ export default function Host() {
     );
 
   const start = async () => {
-    if (source === "clip") {
+    if (fromVideo) {
       setCapturing(true);
       return;
     }
@@ -171,15 +179,15 @@ export default function Host() {
     const tick = async () => {
       try {
         const clipEl = clipVideo.current;
-        const v = source === "clip" ? clipEl! : streamVideo.current!;
+        const v = fromVideo ? clipEl! : streamVideo.current!;
         const box = frameRef.current?.getBoundingClientRect();
         const ready =
-          source === "clip"
+          fromVideo
             ? !!v.videoWidth && !v.paused
             : !!v.videoWidth && !!box;
         if (ready) {
           const c = crop.current!;
-          if (source === "clip") {
+          if (fromVideo) {
             // Read the clip directly, capped at 1280px wide.
             const k = Math.min(1, 1280 / v.videoWidth);
             c.width = Math.round(v.videoWidth * k);
@@ -289,7 +297,9 @@ export default function Host() {
                 .map((f) => f.c.toDataURL("image/jpeg", 0.6).split(",")[1]),
               sharp.toDataURL("image/jpeg", 0.85).split(",")[1],
             ];
-            processFrame({ frames, hint: `${gameHint}; ${t.hint}` })
+            // The video moment these frames show, so link mode can play the call exactly then.
+            const vt = source === "link" ? clipVideo.current?.currentTime : undefined;
+            processFrame({ frames, hint: `${gameHint}; ${t.hint}`, vt })
               .then((r) => {
                 setStats((s) => ({ ...s, last: `${r.event} (${t.reason})` }));
                 setLog((l) => [`${r.event}: ${r.note}`, ...l].slice(0, 6));
@@ -314,7 +324,7 @@ export default function Host() {
     return () => {
       stop = true;
     };
-  }, [capturing, source, processFrame, drawPreview]);
+  }, [capturing, source, fromVideo, processFrame, drawPreview]);
 
   // Keep the talking points fresh while the match runs, and fill quiet moments with them.
   const playersRef = useRef(players);
@@ -373,11 +383,18 @@ export default function Host() {
   const pump = useCallback(function run() {
     if (audioPlaying.current) return;
     const now = Date.now();
+    // In link mode a line that carries its video moment waits for the viewer to reach it, and is dropped once stale.
+    const view = source === "link" ? viewerVideo.current : null;
+    const at = view ? view.currentTime : null;
     queue.current = queue.current
-      .filter((q) => now - q.seenAt < q.ttl)
+      .filter((q) => (q.vt !== undefined && at !== null ? at - q.vt < LATE_S : now - q.seenAt < q.ttl))
       .sort((x, y) => y.priority - x.priority || x.seenAt - y.seenAt);
-    const next = queue.current.shift();
-    if (!next) return;
+    const i = queue.current.findIndex((q) => q.vt === undefined || at === null || at >= q.vt - EARLY_S);
+    if (i < 0) return;
+    // A filler must not start while a timed call is due within its length.
+    const due = at !== null && queue.current.some((q) => q.vt !== undefined && q.vt - at < 3);
+    if (due && queue.current[i].vt === undefined) return;
+    const [next] = queue.current.splice(i, 1);
     const a = new Audio(next.url);
     current.current = a;
     audioPlaying.current = true;
@@ -389,7 +406,7 @@ export default function Host() {
     a.addEventListener("ended", done);
     a.addEventListener("error", done);
     a.play().catch(done);
-  }, []);
+  }, [source]);
 
   useEffect(() => {
     if (!lines) return;
@@ -408,174 +425,321 @@ export default function Host() {
           priority: l.priority ?? 3,
           ttl: l.ttlMs ?? 15000,
           seenAt: now,
+          vt: l.vt,
         });
     }
     pump();
   }, [lines, pump]);
 
+  // Timed lines wait for their moment, so check the queue often, and report how early lines arrive.
+  useEffect(() => {
+    if (!capturing) return;
+    const t = setInterval(pump, 100);
+    return () => clearInterval(t);
+  }, [capturing, pump]);
+  useEffect(() => {
+    const view = viewerVideo.current;
+    const timed = lines?.filter((l) => l.vt !== undefined).slice(0, 5);
+    if (!view || source !== "link" || !timed?.length) return;
+    const leads = timed.map((l) => (l.madeMs ?? 0) / 1000);
+    setGapNote((g) => `${g.split(" | lead")[0]} | lead: calls take ${Math.min(...leads).toFixed(1)}-${Math.max(...leads).toFixed(1)}s to make, delay is ${DELAY_S}s`);
+  }, [lines, source]);
+
+  // Link mode: keep the analysis copy DELAY_S ahead of the viewer, following play, pause and seeks.
+  const [download, setDownload] = useState(""); // only set when something is wrong
+  // Seconds into the match where the current stream starts: 0 for the full match, else a jump-ahead section.
+  const [offset, setOffset] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const availS = useRef(0); // how far the full download has reached, in seconds
+  const matchUrl = id ? `/api/video?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}` : "";
+  const videoSrc = offset ? `${matchUrl}&from=${offset}` : matchUrl;
+  // Seeking past the downloaded part starts a separate stream from that point instead of waiting.
+  const onSeeking = () => {
+    const view = viewerVideo.current;
+    if (!view || offset || !Number.isFinite(view.duration)) return;
+    if (view.currentTime > availS.current - 5) {
+      queue.current = [];
+      setOffset(Math.floor(view.currentTime));
+    }
+  };
+  useEffect(() => {
+    if (source !== "link" || !id) return;
+    const sync = setInterval(() => {
+      const view = viewerVideo.current;
+      const ana = clipVideo.current;
+      if (!view || !ana) return;
+      const target = view.currentTime + DELAY_S;
+      if (Math.abs(ana.currentTime - target) > 0.6) ana.currentTime = target;
+      if (view.paused && !ana.paused) ana.pause();
+      if (!view.paused && ana.paused) ana.play().catch(() => {});
+    }, 250);
+    const status = setInterval(async () => {
+      try {
+        const r = await fetch(`/api/video?status=1&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}`);
+        const j = await r.json();
+        const view = viewerVideo.current;
+        if (view && !offset && Number.isFinite(view.duration)) availS.current = (j.have / j.size) * view.duration;
+        setDownload(j.error && !j.downloading ? `Video error: ${j.error}` : "");
+      } catch {}
+    }, 2000);
+    return () => {
+      clearInterval(sync);
+      clearInterval(status);
+    };
+  }, [source, id, offset]);
+
+  const clock = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+
   return (
-    <main className="mx-auto max-w-5xl p-6 space-y-4">
-      <h1 className="text-2xl font-bold">Booth: host</h1>
-      <div className="flex gap-2">
-        <select
-          className="border rounded px-2 text-black"
-          value={source}
-          disabled={capturing}
-          onChange={(e) => setSource(e.target.value as "clip" | "youtube")}
-        >
-          <option value="clip">Local clip</option>
-          <option value="youtube">YouTube (tab capture)</option>
-        </select>
-        <input
-          className="flex-1 border rounded px-2 py-1 text-black"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-        />
-        <button
-          className="border rounded px-3"
-          onClick={start}
-          disabled={capturing || (source === "youtube" && !id)}
-        >
-          {capturing ? "Capturing" : "Start capture"}
+    <main className="booth-shell">
+      <header className="masthead">
+        <div className="flex items-center gap-3">
+          <span className="brand-mark"><BoothIcon name="mic" /></span>
+          <h1 className="brand-word">booth<span>.</span></h1>
+          <span className="studio-label">Broadcast studio</span>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="masthead-note">Football, with a voice.</span>
+          <span className={`on-air ${capturing ? "is-live" : ""}`} role="status">
+            <span className="status-dot" />{capturing ? "ON AIR" : "STANDBY"}
+          </span>
+        </div>
+      </header>
+
+      <section className="source-bar" aria-label="Broadcast controls">
+        <label className="source-field">
+          <span className="eyebrow">Video source</span>
+          <select value={source} disabled={capturing}
+            onChange={(e) => setSource(e.target.value as "link" | "clip" | "youtube")}>
+            <option value="link">YouTube link (no screen share)</option>
+            <option value="clip">Local clip</option>
+            <option value="youtube">YouTube (tab capture)</option>
+          </select>
+        </label>
+        <label className="url-field">
+          <span className="sr-only">YouTube match link</span>
+          <BoothIcon name="link" />
+          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="Paste a YouTube match link" spellCheck={false} />
+        </label>
+        <button className="start-button" onClick={start}
+          disabled={capturing || (source === "youtube" && !id)}>
+          <BoothIcon name={capturing ? "activity" : "play"} />
+          {capturing ? "On air" : "Start"}
         </button>
-        <button className="border rounded px-3" onClick={() => resetMatch()}>
-          Reset match
-        </button>
-        <button
-          className="border rounded px-3"
-          onClick={() => game.current.toggleDirection()}
-        >
-          Flip direction
-        </button>
+        <div className="utility-actions">
+          <button className="utility-button" onClick={() => resetMatch()}><BoothIcon name="reset" />Reset match</button>
+          <button className="utility-button" onClick={() => game.current.toggleDirection()}><BoothIcon name="flip" />Flip direction</button>
+        </div>
+      </section>
+
+      <div className="broadcast-grid">
+        <div className="min-w-0">
+          <section className="player-panel" aria-labelledby="match-heading">
+            <div className="panel-heading">
+              <div className="flex items-center gap-3">
+                <span className={`live-badge ${capturing ? "is-live" : ""}`}><span className="status-dot" />{capturing ? "LIVE" : "PREVIEW"}</span>
+                <h2 id="match-heading" className="text-sm font-medium">Match broadcast</h2>
+              </div>
+              <span className="eyebrow text-muted">{source === "clip" ? "Local clip" : "YouTube"}</span>
+            </div>
+            <div className="player-screen">
+              {source === "link" && id && (
+                <>
+                  {/* The analysis video stays mounted and follows the viewer. */}
+                  <video
+                    ref={viewerVideo}
+                    src={videoSrc}
+                    onSeeking={onSeeking}
+                    onWaiting={() => setLoading(true)}
+                    onPlaying={() => setLoading(false)}
+                    onCanPlay={() => setLoading(false)}
+                    // A jump-ahead swaps the source, which pauses the player; carry on playing.
+                    onLoadedMetadata={(e) => offset > 0 && e.currentTarget.play().catch(() => {})}
+                    muted
+                    controls
+                    playsInline
+                    preload="auto"
+                    className="match-video"
+                    aria-label="Match broadcast"
+                  />
+                  <video
+                    ref={clipVideo}
+                    src={videoSrc}
+                    muted
+                    playsInline
+                    preload="auto"
+                    className="hidden"
+                    title={`analysis copy, ${DELAY_S}s ahead`}
+                  />
+                </>
+              )}
+              {source === "clip" && (
+                <video ref={clipVideo} src={CLIP} muted controls playsInline className="match-video" aria-label="Local match clip" />
+              )}
+              {source === "youtube" && id && (
+                <iframe ref={frameRef} onLoad={() => setTimeout(muteYoutube, 1500)}
+                  className="match-video" title="YouTube match broadcast"
+                  src={`https://www.youtube.com/embed/${id}?enablejsapi=1&rel=0`}
+                  allow="autoplay; encrypted-media" />
+              )}
+              {source !== "clip" && !id && (
+                <div className="player-placeholder">
+                  <BoothIcon name="play" />
+                  <h3>Your next match starts here.</h3>
+                  <p>Paste a valid YouTube match link above to load the broadcast.</p>
+                </div>
+              )}
+            </div>
+            <div className="player-footer">
+              <div className="flex items-center gap-2 text-sm">
+                <BoothIcon name="mic" className="text-accent" />
+                <span>AI commentary</span><span className="text-muted">/</span>
+                <span className="text-muted">{capturing ? "On air" : "Ready when you are"}</span>
+              </div>
+              <p className="player-instruction">
+                {source === "youtube" ? 'Press Start, choose “This tab”, then play the video.' : "Press Start, then play the video."}
+              </p>
+              {source === "link" && id && (download || loading || offset > 0) && (
+                <p className="download-status" role="status">
+                  <span className="status-dot" />
+                  {download ||
+                    (loading
+                      ? offset
+                        ? `Jumping to ${clock(offset)}… about 20 seconds`
+                        : "Loading…"
+                      : `Watching from ${clock(offset)}`)}
+                  {offset > 0 && (
+                    <button type="button" className="ml-3 underline" onClick={() => { queue.current = []; setOffset(0); }}>
+                      Back to full match
+                    </button>
+                  )}
+                </p>
+              )}
+            </div>
+          </section>
+        </div>
+
+        <aside className="commentary-rail" aria-label="Live match insights">
+          <CommentatorPicker />
+          <section className="game-panel" aria-labelledby="game-heading">
+            <div className="flex items-center justify-between gap-3">
+              <h2 id="game-heading" className="rail-title"><BoothIcon name="activity" />Game read</h2>
+              <span className="eyebrow text-muted">{read ? "Tracking" : "Awaiting play"}</span>
+            </div>
+            <div className="mt-6 flex items-end justify-between">
+              <span className="eyebrow text-muted">Danger level</span>
+              <span className="danger-number">{read ? Math.round(read.r.danger) : "—"}<span>/100</span></span>
+            </div>
+            <div className="danger-track" role="meter" aria-label="Danger level" aria-valuemin={0} aria-valuemax={100}
+              aria-valuenow={read?.r.danger ?? 0} aria-valuetext={read ? `${Math.round(read.r.danger)} out of 100` : "Awaiting play"}>
+              <div className="danger-fill" style={{ width: `${read?.r.danger ?? 0}%` }} />
+            </div>
+            <div className="mt-2 flex justify-between font-mono text-[10px] uppercase tracking-wider text-muted"><span>Settled</span><span>Threatening</span></div>
+            <p className="game-description">{read ? describeRead(read.r, read.names) : "The shape of the game, as it happens. Start commentary to track possession, pressure and danger."}</p>
+          </section>
+
+          <section className="feed-panel" aria-labelledby="feed-heading">
+            <div className="panel-heading">
+              <h2 id="feed-heading" className="rail-title"><BoothIcon name="mic" />Commentary</h2>
+              <span className="eyebrow text-muted">Newest first</span>
+            </div>
+            <div className="feed-scroll" role="region" aria-label="Commentary feed" tabIndex={0}>
+              {lines?.length ? (
+                <ol className="commentary-list" aria-live="polite" aria-relevant="additions">
+                  {lines.map((l, index) => (
+                    <li key={l._id} className={`commentary-line ${l.event === "goal" ? "goal-line" : ""}`}>
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <span className="event-badge" data-event={l.event}>{l.event === "goal" && <span aria-hidden="true">⚽ </span>}{l.event}</span>
+                        {index === 0 && <span className="latest-label">Latest call</span>}
+                      </div>
+                      <p>{l.text}</p>
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <div className="feed-empty">
+                  <div className="empty-wave" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /></div>
+                  <h3>Every moment. A voice.</h3>
+                  <p>{lines === undefined ? "Connecting to the commentary feed…" : "Start the broadcast and press play. The live calls will land right here."}</p>
+                  <span className="eyebrow">The booth is yours</span>
+                </div>
+              )}
+            </div>
+            <div className="feed-footer"><span className={`status-dot ${capturing ? "text-accent" : ""}`} />{capturing ? "Live commentary enabled" : "Waiting for kick-off"}</div>
+          </section>
+        </aside>
       </div>
-      <p className="text-sm opacity-70">
-        Press Start capture, choose &quot;This tab&quot;, then press play on the
-        video. {model}
-      </p>
-      <label className="block text-sm">
-        Clubs for talking points (name, town, league; comma separated)
-        <input
-          className="w-full border rounded px-2 py-1 text-black"
-          value={clubs}
-          onChange={(e) => setClubs(e.target.value)}
-        />
-      </label>
-      <details className="text-sm">
-        <summary className="cursor-pointer">
-          Lineup (paste team name, then &quot;number name&quot; per line)
-        </summary>
-        <textarea
-          className="w-full h-40 border rounded p-2 font-mono text-black"
-          placeholder={
-            "Bashkimi\n1 Name Surname\n9 Name Surname\n\nShkendija\n1 Name Surname"
-          }
-          value={rosterText ?? savedRoster ?? ""}
-          onChange={(e) => setRosterText(e.target.value)}
-        />
-        <button
-          className="border rounded px-3 mt-1"
-          onClick={() =>
-            saveRoster({ roster: rosterText ?? savedRoster ?? "" })
-          }
-        >
-          Save lineup
-        </button>
-        <button
-          className="border rounded px-3 mt-1 ml-2"
-          onClick={() => {
-            setLineupNote("searching...");
-            findLineup({ clubs: clubList })
-              .then((r) => {
-                setRosterText(r.roster);
-                setLineupNote(
-                  `found; check the names, then press Save lineup. Source: ${r.sources.join(", ") || "none"}`,
-                );
-              })
-              .catch((e) =>
-                setLineupNote(`failed: ${e instanceof Error ? e.message : e}`),
-              );
-          }}
-        >
-          Find lineups online
-        </button>
-        <span className="ml-2 text-xs opacity-70">{lineupNote}</span>
-      </details>
-      {source === "clip" && (
-        <video
-          ref={clipVideo}
-          src={CLIP}
-          muted
-          controls
-          playsInline
-          className="w-full aspect-video bg-black"
-        />
-      )}
-      {source === "youtube" && id && (
-        <iframe
-          ref={frameRef}
-          onLoad={() => setTimeout(muteYoutube, 1500)}
-          className="w-full aspect-video"
-          src={`https://www.youtube.com/embed/${id}?enablejsapi=1&rel=0`}
-          allow="autoplay; encrypted-media"
-        />
-      )}
+
       <video ref={streamVideo} muted playsInline className="hidden" />
       <canvas ref={crop} className="hidden" />
-      <div className="grid md:grid-cols-2 gap-4">
-        <div>
-          <canvas ref={preview} className="w-full bg-black" />
-          <p className="text-sm font-mono">
-            players {stats.players} | ball {stats.ball} | speed{" "}
-            {stats.speed.toFixed(2)} | cut {stats.cut.toFixed(0)} | pitch{" "}
-            {stats.pitchMs}ms | ball model {stats.ballMs.toFixed(0)}ms | last:{" "}
-            {stats.last}
-          </p>
-          {read && (
-            <div className="text-sm font-mono space-y-1">
-              <div className="h-2 bg-neutral-800 rounded">
-                <div
-                  className="h-2 rounded bg-rose-500 transition-all"
-                  style={{ width: `${read.r.danger}%` }}
-                />
-              </div>
-              <p>{describeRead(read.r, read.names)}</p>
-            </div>
-          )}
-        </div>
-        <div className="space-y-2">
-          <div className="text-xs font-mono space-y-1">
-            <p className="opacity-70">
-              talking points {topicNote} | {gapNote}
-            </p>
-            {topics?.map((t) => (
-              <p key={t._id} title={t.detail}>
-                {t.score} · {t.kind} · {t.subject} · {t.window}
-                {t.usedCount ? ` · used ${t.usedCount}x` : ""} ·{" "}
-                <a
-                  className="underline"
-                  href={t.sourceUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  {t.sourceName}
-                </a>
+      <details className="engine-room">
+        <summary>
+          <span className="flex items-center gap-3"><BoothIcon name="sliders" /><span>Engine room</span><span className="engine-subtitle">Detection, match context & diagnostics</span></span>
+          <span className="flex items-center gap-3"><span className="model-status">{model}</span><BoothIcon name="chevron" className="engine-chevron" /></span>
+        </summary>
+        <div className="engine-content">
+          <div className="engine-grid">
+            <section className="min-w-0">
+              <h3 className="eyebrow mb-3">Vision preview</h3>
+              {/* Keep this canvas mounted when the engine room is closed. */}
+              <canvas ref={preview} className="detection-preview" aria-label="Live player and ball detections" />
+              <p className="diagnostic-text mt-3">
+                players {stats.players} | ball {stats.ball} | speed{" "}
+                {stats.speed.toFixed(2)} | cut {stats.cut.toFixed(0)} | pitch{" "}
+                {stats.pitchMs}ms | ball model {stats.ballMs.toFixed(0)}ms | last:{" "}
+                {stats.last}
               </p>
-            ))}
+              <h3 className="eyebrow mb-3 mt-6">Haiku log</h3>
+              <ul className="space-y-2">
+                {log.map((l, i) => <li key={i} className="diagnostic-text">haiku → {l}</li>)}
+              </ul>
+            </section>
+            <section className="min-w-0">
+              <h3 className="eyebrow mb-3">Match context</h3>
+              <label className="block text-sm text-muted">
+                Clubs for talking points (name, town, league; comma separated)
+                <input className="engine-input mt-2" value={clubs} onChange={(e) => setClubs(e.target.value)} />
+              </label>
+              <details className="lineup-box mt-4">
+                <summary>Lineup <span className="text-xs text-muted">Team name, then “number name” per line</span></summary>
+                <textarea className="engine-input mt-3 h-40 font-mono text-xs"
+                  aria-label="Team lineup"
+                  placeholder={"Bashkimi\n1 Name Surname\n9 Name Surname\n\nShkendija\n1 Name Surname"}
+                  value={rosterText ?? savedRoster ?? ""} onChange={(e) => setRosterText(e.target.value)} />
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button className="secondary-button" onClick={() => saveRoster({ roster: rosterText ?? savedRoster ?? "" })}>Save lineup</button>
+                  <button className="secondary-button" onClick={() => {
+                    setLineupNote("searching...");
+                    findLineup({ clubs: clubList })
+                      .then((r) => {
+                        setRosterText(r.roster);
+                        setLineupNote(
+                          `found; check the names, then press Save lineup. Source: ${r.sources.join(", ") || "none"}`,
+                        );
+                      })
+                      .catch((e) =>
+                        setLineupNote(`failed: ${e instanceof Error ? e.message : e}`),
+                      );
+                  }}>Find lineups online</button>
+                </div>
+                <p className="diagnostic-text mt-2" role="status">{lineupNote}</p>
+              </details>
+              <h3 className="eyebrow mb-3 mt-6">Talking points</h3>
+              <p className="diagnostic-text mb-3">talking points {topicNote} | {gapNote}</p>
+              <div className="space-y-2">
+                {topics?.map((t) => (
+                  <p key={t._id} title={t.detail} className="diagnostic-text">
+                    {t.score} · {t.kind} · {t.subject} · {t.window}
+                    {t.usedCount ? ` · used ${t.usedCount}x` : ""} ·{" "}
+                    <a className="underline decoration-white/30 underline-offset-4 hover:text-accent" href={t.sourceUrl} target="_blank" rel="noreferrer">{t.sourceName}</a>
+                  </p>
+                ))}
+              </div>
+            </section>
           </div>
-          <ul className="space-y-1">
-            {log.map((l, i) => (
-              <li key={i} className="text-xs opacity-60 font-mono">
-                haiku → {l}
-              </li>
-            ))}
-            {lines?.map((l) => (
-              <li key={l._id}>
-                <b>{l.event}</b>: {l.text}
-              </li>
-            ))}
-          </ul>
         </div>
-      </div>
+      </details>
+      <footer className="studio-footer"><span>BOOTH <span className="text-accent">/</span> THE BEAUTIFUL GAME, CALLED YOUR WAY.</span><span>LIVE AI COMMENTARY</span></footer>
     </main>
   );
 }

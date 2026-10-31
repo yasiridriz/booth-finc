@@ -113,3 +113,20 @@ The aim is no dead air, without overlapping or repeating.
 - **Status line.** The host page shows what the last gap request returned (`gap line: color`, `server said wait`, or the error).
 - **Limits.** The color prompt maps shirt colours to team names through `state.teams`; if the vision model has not identified the teams yet, it may guess.
   Color lines can add small embellishments (for example "chase shadows"). Tighten `COLOR_SYSTEM` if that is a problem.
+
+### Link mode, broadcast delay, styles (host page, `app/api/video/route.ts`, `convex/personas.ts`)
+- **Paste a link, no screen share.** Source "YouTube link" plays `/api/video?url=<youtube>` in a page `<video>`, so frames are read
+  directly. The route runs `yt-dlp` to download the match to `.cache/videos/<id>.mp4.part` (about 14x real time; resumes after a
+  restart) and serves byte ranges of what has arrived. YouTube refuses plain fetches of its stream URLs, so yt-dlp must do the download.
+- **Jump-ahead.** Seeking past the downloaded part switches the source to `&from=<seconds>`: a second yt-dlp run with
+  `--download-sections` writing fragmented mp4, streamed as it grows. About 20 s to start. "Back to full match" returns.
+- **Broadcast delay.** A hidden analysis `<video>` runs `DELAY_S` (7 s) ahead of the one the viewer watches. Event lines carry `vt`
+  (the video time they describe) and `madeMs`; the page plays a timed line when the viewer reaches `vt`, drops it 2.5 s late, and holds
+  fillers when a timed call is due. Calls measured at 5.0-6.4 s to make (vision ~2.5 s, Haiku, ElevenLabs ~2.5 s).
+- **Styles and languages.** `convex/personas.ts`: 6 styles (hype, tactician, conspiracy, grandpa, poet, ultra), each with its own
+  ElevenLabs voice, x English/French. Stored in `state.style` / `state.lang` via `booth.setPersona`; both survive "Reset match".
+  Event calls and gap lines put the persona prompt first. Reset match also clears talking points (they belong to the last match's clubs).
+- **Deployment caveat.** `/api/video` needs a long-lived Node server with `yt-dlp` and `ffmpeg` on PATH and a writable disk. It will not
+  work on serverless hosting (e.g. Vercel functions). Host it on a VM/container, or keep it on the demo laptop.
+- **Model files.** `public/models/pitch.onnx` (172 MB) is gitignored (over GitHub's limit); copy it by hand. `football.onnx` and
+  `yolov9-ball.onnx` are committed.

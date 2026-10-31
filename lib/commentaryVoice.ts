@@ -9,6 +9,9 @@ const DELIVERY: Record<string, string> = {
   save: "[surprised] [excited]",
   foul: "[frustrated] [animated]",
   celebration: "[excited] [shouts]",
+  penalty: "[excited] [shouts]",
+  handball: "[excited] [shouts]",
+  card: "[excited]",
   cross: "[excited]",
   tackle: "[excited]",
   dribble: "[excited]",
@@ -24,11 +27,11 @@ export function speechText(text: string, event: string) {
   return `${DELIVERY[event] ?? "[animated]"} ${clean}`;
 }
 
-export async function synthesizeCommentary(text: string, event: string) {
+export async function synthesizeCommentary(text: string, event: string, voiceId?: string) {
   const apiKey = process.env.ELEVENLABS_API_KEY ?? process.env.ELEVENLABS_KEY;
   if (!apiKey) throw new Error("Set ELEVENLABS_API_KEY on the Convex deployment");
   const model = process.env.ELEVENLABS_MODEL_ID ?? DEFAULT_VOICE_MODEL;
-  const voice = process.env.ELEVENLABS_VOICE_ID ?? DEFAULT_VOICE_ID;
+  const voice = voiceId ?? process.env.ELEVENLABS_VOICE_ID ?? DEFAULT_VOICE_ID;
   // Only these expressive model families understand inline audio directions.
   const expressive = /^eleven_v[34](?:_|$)/.test(model);
   const directed = speechText(text, event);

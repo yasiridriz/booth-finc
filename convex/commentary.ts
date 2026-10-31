@@ -4,6 +4,7 @@ import { v } from "convex/values";
 import Anthropic from "@anthropic-ai/sdk";
 import { textOf } from "./vision";
 import { synthesizeCommentary } from "../lib/commentaryVoice";
+import { STYLES, personaPrompt } from "./personas";
 
 const MODEL = "claude-haiku-5-5";
 const MIN_AFTER_LINE_MS = 1_500; // the page also waits for the audio to be nearly done
@@ -127,18 +128,20 @@ export const next = action({
         model: MODEL,
         max_tokens: 120,
         thinking: { type: "disabled" },
-        system,
+        // The persona sets voice, energy and language; the task prompt sets what to say.
+        system: `${personaPrompt(match.style, match.lang)}\n\nTask (your persona overrides any energy level it mentions): ${system}`,
         messages: [{ role: "user", content: user }],
       });
       const text = textOf(res.content);
       const voice = await synthesizeCommentary(
         text,
         kind === "banter" ? "banter" : "color",
+        STYLES.find((s) => s.id === match.style)?.voiceId,
       );
       const audioId = await ctx.storage.store(voice.audio);
       const audioUrl = (await ctx.storage.getUrl(audioId)) ?? undefined;
       await ctx.runMutation(internal.booth.insertLine, {
-        persona: "commentator",
+        persona: `${match.style}:${match.lang}`,
         event: kind,
         text,
         audioUrl,

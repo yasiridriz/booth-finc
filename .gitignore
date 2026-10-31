@@ -44,3 +44,6 @@ next-env.d.ts
 # 172MB pitch model, over GitHub's file limit
 public/models/pitch.onnx
 public/clips/
+
+# Match videos downloaded by app/api/video
+.cache/
