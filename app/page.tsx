@@ -12,10 +12,10 @@ import { withOrt } from "@/lib/ortLock";
 import { BoothIcon } from "@/components/BoothIcon";
 import { CommentatorPicker } from "@/components/CommentatorPicker";
 import { asset } from "@/lib/assets";
-import { DemoGuide } from "@/components/DemoGuide";
-import { AVAILABLE, clipUrl, loadMatches, usable, type Match } from "@/lib/matches";
 
 const CLIP = asset("/clips/bashkimi-shkendija-10-20.mp4"); // local sample, no screen share needed
+const DEFAULT_CLUBS =
+  "Arsenal (London, Premier League), Tottenham Hotspur (London, Premier League)";
 const TOPIC_REFRESH_MS = 5 * 60 * 1000;
 const FILLER_CHECK_MS = 1500; // how often to ask whether a gap line is needed
 const QUIET_BEFORE_FILLER_MS = 4000; // silence needed before a filler is asked for
@@ -41,25 +41,14 @@ function dateFromTitle(title: string): string | null {
   if (long) return `${long[3]}-${pad(MONTHS.indexOf(long[2]) + 1)}-${pad(+long[1])}`;
   return null;
 }
-const first = AVAILABLE[0]; // the match that is selected before the visitor picks
 
 function videoId(url: string) {
   return url.match(/(?:v=|youtu\.be\/|embed\/|live\/)([\w-]{11})/)?.[1] ?? null;
 }
 
 export default function Host() {
-  const [url, setUrl] = useState(first.kind === "link" ? first.link : DEFAULT_URL);
+  const [url, setUrl] = useState(DEFAULT_URL);
   const [capturing, setCapturing] = useState(false);
-  // Visitors see the three-step walkthrough. Open /?operator for the full controls.
-  const [operator, setOperator] = useState(false);
-  const [matchId, setMatchId] = useState(AVAILABLE[0].id);
-  const [clipSrc] = useState(CLIP); // operator "Local clip" source
-  // A video file (R2 or local) played through the same delayed viewer as a pasted link.
-  const [directSrc, setDirectSrc] = useState<string | null>(first.kind === "clip" ? clipUrl(first.file) : null);
-  const [matches, setMatches] = useState<Match[]>(AVAILABLE);
-  useEffect(() => {
-    setOperator(new URLSearchParams(window.location.search).has("operator"));
-  }, []);
   const [source, setSource] = useState<"link" | "clip" | "youtube">("link");
   // Link and clip modes read frames straight from a <video>; only YouTube mode needs tab capture.
   const fromVideo = source !== "youtube";
@@ -99,11 +88,10 @@ export default function Host() {
   const [lineupNote, setLineupNote] = useState("");
   const refreshTopics = useAction(api.topics.refresh);
   const nextLine = useAction(api.commentary.next);
-
+  const [clubs, setClubs] = useState(DEFAULT_CLUBS);
   // YYYY-MM-DD of a past match being replayed, so talking points come from that time. Empty means live: today's news.
   const [matchDate, setMatchDate] = useState("");
   const dateTouched = useRef(false);
-  const [clubs, setClubs] = useState(first.clubs);
   const [topicNote, setTopicNote] = useState("");
   const [gapNote, setGapNote] = useState("gap lines: waiting");
   const saveRoster = useMutation(api.booth.setRoster);
@@ -153,13 +141,6 @@ export default function Host() {
   const start = async () => {
     if (fromVideo) {
       setCapturing(true);
-      if (!operator) {
-        // The click is the user gesture that lets the voice play, so start everything here.
-        resetMatch();
-        // Names only for a match whose lineup we know; a lineup left from another match would put wrong names on the air.
-        saveRoster({ roster: matches.find((m) => m.id === matchId)?.lineup ?? "" });
-        (source === "link" ? viewerVideo : clipVideo).current?.play().catch(() => {});
-      }
       return;
     }
     const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -492,19 +473,19 @@ export default function Host() {
   const [loading, setLoading] = useState(false);
   const availS = useRef(0); // how far the full download has reached, in seconds
   const matchUrl = id ? `/api/video?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}` : "";
-  const videoSrc = directSrc ?? (offset ? `${matchUrl}&from=${offset}` : matchUrl);
+  const videoSrc = offset ? `${matchUrl}&from=${offset}` : matchUrl;
   // Seeking past the downloaded part starts a separate stream from that point instead of waiting.
   const onSeeking = () => {
     const view = viewerVideo.current;
-    // availS is 0 until the first status check; never jump on a guess. A direct video file never jumps.
-    if (!view || offset || directSrc || !Number.isFinite(view.duration) || availS.current === 0) return;
+    // availS is 0 until the first status check; never jump on a guess.
+    if (!view || offset || !Number.isFinite(view.duration) || availS.current === 0) return;
     if (view.currentTime > availS.current - 5) {
       queue.current = [];
       setOffset(Math.floor(view.currentTime));
     }
   };
   useEffect(() => {
-    if (source !== "link" || (!id && !directSrc)) return;
+    if (source !== "link" || !id) return;
     const sync = setInterval(() => {
       const view = viewerVideo.current;
       const ana = clipVideo.current;
@@ -514,8 +495,7 @@ export default function Host() {
       if (view.paused && !ana.paused) ana.pause();
       if (!view.paused && ana.paused) ana.play().catch(() => {});
     }, 250);
-    // A plain video file has no download to watch.
-    const status = directSrc ? null : setInterval(async () => {
+    const status = setInterval(async () => {
       try {
         const r = await fetch(`/api/video?status=1&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}`);
         const j = await r.json();
@@ -535,37 +515,9 @@ export default function Host() {
     }, 2000);
     return () => {
       clearInterval(sync);
-      if (status) clearInterval(status);
+      clearInterval(status);
     };
-  }, [source, id, offset, directSrc]);
-
-  // Visitors see an empty feed until kick-off, so they never meet lines from an earlier run.
-  const feed = operator || capturing ? lines : lines === undefined ? undefined : [];
-
-  const pickMatch = (m: Match) => {
-    if (capturing) return;
-    setMatchId(m.id);
-    setClubs(m.clubs);
-    setOffset(0);
-    setSource("link"); // both kinds play through the delayed viewer
-    if (m.kind === "link") {
-      setUrl(m.link);
-      setDirectSrc(null);
-    } else {
-      setDirectSrc(clipUrl(m.file));
-    }
-  };
-
-  // The bucket's matches.json replaces the built-in list, so a match can be added without a code change.
-  useEffect(() => {
-    loadMatches().then((list) => {
-      const usableList = list && usable(list);
-      if (!usableList?.length) return;
-      setMatches(usableList);
-      if (!usableList.some((m) => m.id === matchId)) pickMatch(usableList[0]);
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [source, id, offset]);
 
   const clock = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
 
@@ -585,7 +537,6 @@ export default function Host() {
         </div>
       </header>
 
-      {operator ? (
       <section className="source-bar" aria-label="Broadcast controls">
         <label className="source-field">
           <span className="eyebrow">Video source</span>
@@ -611,9 +562,6 @@ export default function Host() {
           <button className="utility-button" onClick={() => game.current.toggleDirection()}><BoothIcon name="flip" />Flip direction</button>
         </div>
       </section>
-      ) : (
-        <DemoGuide matches={matches} matchId={matchId} onPick={pickMatch} capturing={capturing} onKickOff={start} />
-      )}
 
       <div className="broadcast-grid">
         <div className="min-w-0">
@@ -626,14 +574,7 @@ export default function Host() {
               <span className="eyebrow text-muted">{source === "clip" ? "Local clip" : "YouTube"}</span>
             </div>
             <div className="player-screen">
-              {!operator && !capturing && (
-                <div className="player-overlay">
-                  <button type="button" className="overlay-play" onClick={start}>
-                    <BoothIcon name="play" />Kick off
-                  </button>
-                </div>
-              )}
-              {source === "link" && (id || directSrc) && (
+              {source === "link" && id && (
                 <>
                   {/* The analysis video stays mounted and follows the viewer. */}
                   <video
@@ -664,7 +605,7 @@ export default function Host() {
                 </>
               )}
               {source === "clip" && (
-                <video ref={clipVideo} src={clipSrc} muted controls playsInline className="match-video" aria-label="Local match clip" />
+                <video ref={clipVideo} src={CLIP} muted controls playsInline className="match-video" aria-label="Local match clip" />
               )}
               {source === "youtube" && id && (
                 <iframe ref={frameRef} onLoad={() => setTimeout(muteYoutube, 1500)}
@@ -672,7 +613,7 @@ export default function Host() {
                   src={`https://www.youtube.com/embed/${id}?enablejsapi=1&rel=0`}
                   allow="autoplay; encrypted-media" />
               )}
-              {source !== "clip" && !id && !directSrc && (
+              {source !== "clip" && !id && (
                 <div className="player-placeholder">
                   <BoothIcon name="play" />
                   <h3>Your next match starts here.</h3>
@@ -686,9 +627,9 @@ export default function Host() {
                 <span>AI commentary</span><span className="text-muted">/</span>
                 <span className="text-muted">{capturing ? "On air" : "Ready when you are"}</span>
               </div>
-              {operator && (<p className="player-instruction">
-                                {source === "youtube" ? 'Press Start, choose “This tab”, then play the video.' : "Press Start, then play the video."}
-                              </p>)}
+              <p className="player-instruction">
+                {source === "youtube" ? 'Press Start, choose “This tab”, then play the video.' : "Press Start, then play the video."}
+              </p>
               {source === "link" && id && (download || loading || offset > 0) && (
                 <p className="download-status" role="status">
                   <span className="status-dot" />
@@ -734,9 +675,9 @@ export default function Host() {
               <span className="eyebrow text-muted">Newest first</span>
             </div>
             <div className="feed-scroll" role="region" aria-label="Commentary feed" tabIndex={0}>
-              {feed?.length ? (
+              {lines?.length ? (
                 <ol className="commentary-list" aria-live="polite" aria-relevant="additions">
-                  {feed.map((l, index) => (
+                  {lines.map((l, index) => (
                     <li key={l._id} className={`commentary-line ${l.event === "goal" ? "goal-line" : ""}`}>
                       <div className="mb-3 flex items-center justify-between gap-2">
                         <span className="flex items-center gap-2">
@@ -754,7 +695,7 @@ export default function Host() {
                 <div className="feed-empty">
                   <div className="empty-wave" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /></div>
                   <h3>Every moment. A voice.</h3>
-                  <p>{feed === undefined ? "Connecting to the commentary feed…" : "Press Kick off. The live calls land right here."}</p>
+                  <p>{lines === undefined ? "Connecting to the commentary feed…" : "Start the broadcast and press play. The live calls will land right here."}</p>
                   <span className="eyebrow">The booth is yours</span>
                 </div>
               )}
@@ -766,7 +707,7 @@ export default function Host() {
 
       <video ref={streamVideo} muted playsInline className="hidden" />
       <canvas ref={crop} className="hidden" />
-      <details className={`engine-room ${operator ? "" : "hidden"}`}>
+      <details className="engine-room">
         <summary>
           <span className="flex items-center gap-3"><BoothIcon name="sliders" /><span>Engine room</span><span className="engine-subtitle">Detection, match context & diagnostics</span></span>
           <span className="flex items-center gap-3"><span className="model-status">{model}</span><BoothIcon name="chevron" className="engine-chevron" /></span>
