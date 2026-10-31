@@ -496,7 +496,8 @@ export default function Host() {
   // Seeking past the downloaded part starts a separate stream from that point instead of waiting.
   const onSeeking = () => {
     const view = viewerVideo.current;
-    if (!view || offset || directSrc || !Number.isFinite(view.duration)) return;
+    // availS is 0 until the first status check; never jump on a guess. A direct video file never jumps.
+    if (!view || offset || directSrc || !Number.isFinite(view.duration) || availS.current === 0) return;
     if (view.currentTime > availS.current - 5) {
       queue.current = [];
       setOffset(Math.floor(view.currentTime));
@@ -519,7 +520,8 @@ export default function Host() {
         const r = await fetch(`/api/video?status=1&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}`);
         const j = await r.json();
         const view = viewerVideo.current;
-        if (view && !offset && Number.isFinite(view.duration)) availS.current = (j.have / j.size) * view.duration;
+        if (view && !offset && Number.isFinite(view.duration))
+          availS.current = !j.downloading && j.have >= j.size ? Infinity : (j.have / j.size) * view.duration;
         setDownload(j.error && !j.downloading ? `Video error: ${j.error}` : "");
         // Classic-match uploads put the date in the title, e.g. "FULL MATCH | 12/2/2018" or "2 December 2018".
         if (!dateTouched.current && j.title) {
