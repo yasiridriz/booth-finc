@@ -3,6 +3,7 @@
 // It is slow, so it runs on its own schedule beside the main loop and never blocks it.
 import type { Box } from "./detector";
 import { withOrt } from "./ortLock";
+import { asset } from "./assets";
 
 const SIZE = 1280;
 const MIN_CONF = 0.25;
@@ -21,7 +22,7 @@ function load() {
     ort.env.wasm.wasmPaths =
       "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/";
     const session = await ort.InferenceSession.create(
-      "/models/yolov9-ball.onnx",
+      asset("/models/yolov9-ball.onnx"),
       {
         executionProviders: ["webgpu", "wasm"],
       },

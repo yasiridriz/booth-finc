@@ -11,8 +11,9 @@ import { BallWorker } from "@/lib/ballDetector";
 import { withOrt } from "@/lib/ortLock";
 import { BoothIcon } from "@/components/BoothIcon";
 import { CommentatorPicker } from "@/components/CommentatorPicker";
+import { asset } from "@/lib/assets";
 
-const CLIP = "/clips/bashkimi-shkendija-10-20.mp4"; // local sample, no screen share needed
+const CLIP = asset("/clips/bashkimi-shkendija-10-20.mp4"); // local sample, no screen share needed
 const DEFAULT_CLUBS =
   "Arsenal (London, Premier League), Tottenham Hotspur (London, Premier League)";
 const TOPIC_REFRESH_MS = 5 * 60 * 1000;

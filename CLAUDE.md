@@ -114,6 +114,7 @@ The aim is no dead air, without overlapping or repeating.
 - **Limits.** The color prompt maps shirt colours to team names through `state.teams`; if the vision model has not identified the teams yet, it may guess.
   Color lines can add small embellishments (for example "chase shadows"). Tighten `COLOR_SYSTEM` if that is a problem.
 
+<<<<<<< Updated upstream
 ### Link mode, broadcast delay, styles (host page, `app/api/video/route.ts`, `convex/personas.ts`)
 - **Paste a link, no screen share.** Source "YouTube link" plays `/api/video?url=<youtube>` in a page `<video>`, so frames are read
   directly. The route runs `yt-dlp` to download the match to `.cache/videos/<id>.mp4.part` (about 14x real time; resumes after a
@@ -130,3 +131,17 @@ The aim is no dead air, without overlapping or repeating.
   work on serverless hosting (e.g. Vercel functions). Host it on a VM/container, or keep it on the demo laptop.
 - **Model files.** `public/models/pitch.onnx` (172 MB) is gitignored (over GitHub's limit); copy it by hand. `football.onnx` and
   `yolov9-ball.onnx` are committed.
+=======
+### Static deploy (Cloudflare, GitHub Pages, any static host)
+All app code runs in the browser or in Convex, so the site can be plain files.
+- `npm run build:static` sets `STATIC_EXPORT=1` (see `next.config.ts`: it sets `output: "export"` and turns off `cacheComponents`
+  and `partialPrefetching`, which cannot be used with an export), builds into `out/`, then deletes `out/models`, `out/clips`
+  and the bundled ORT `.wasm`. `out/` is about 3 MB. The ORT wasm is loaded from jsdelivr (`ort.env.wasm.wasmPaths`).
+- The models and the sample clip are too big for hosts with a per-file cap (Cloudflare: 25 MiB). Put `public/models/*` and
+  `public/clips/*` on a public bucket (for example Cloudflare R2, with a CORS rule that allows the site origin) and set
+  `NEXT_PUBLIC_ASSET_BASE` to its URL. `lib/assets.ts` (`asset()`) adds it to every model and clip URL. Empty means local `/public`.
+- `public/models/pitch.onnx` and `public/clips/` are gitignored, so a Git-based build never has them. They must come from the bucket.
+- Set `NEXT_PUBLIC_CONVEX_URL` to the production Convex URL (`npx convex deploy`), and set the Convex env vars on that
+  deployment again (they do not carry over from dev): `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY`, `FIRECRAWL_API_KEY`, `ELEVENLABS_VOICE_ID`.
+- Convex actions are public and have no login. Anyone with the site URL can spend the API keys. Add a passcode before sharing widely.
+>>>>>>> Stashed changes

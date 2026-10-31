@@ -1,8 +1,14 @@
+import { asset } from "./assets";
 // In-browser YOLOv8n detector fine-tuned on football broadcasts.
 // Input is a 640x640 letterboxed frame; output is [1, 8, 8400].
 // Classes: 0 ball, 1 goalkeeper, 2 player, 3 referee.
 export type Box = { x: number; y: number; w: number; h: number; score: number };
-export type Detections = { players: Box[]; goalkeepers: Box[]; referees: Box[]; ball: Box | null };
+export type Detections = {
+  players: Box[];
+  goalkeepers: Box[];
+  referees: Box[];
+  ball: Box | null;
+};
 
 const SIZE = 640;
 const BALL = 0;
@@ -14,22 +20,30 @@ const PERSON_MIN = 0.35;
 const BALL_MIN = 0.15;
 
 type Ort = typeof import("onnxruntime-web/all");
-let ortPromise: Promise<{ ort: Ort; session: import("onnxruntime-web/all").InferenceSession }> | null = null;
+let ortPromise: Promise<{
+  ort: Ort;
+  session: import("onnxruntime-web/all").InferenceSession;
+}> | null = null;
 
 export function loadDetector() {
   ortPromise ??= (async () => {
     const ort = await import("onnxruntime-web/all");
     ort.env.logLevel = "error";
-    ort.env.wasm.wasmPaths ="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/";
-    const session = await ort.InferenceSession.create("/models/football.onnx", {
-      executionProviders: ["webgpu", "wasm"],
-    });
+    ort.env.wasm.wasmPaths =
+      "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/";
+    const session = await ort.InferenceSession.create(
+      asset("/models/football.onnx"),
+      {
+        executionProviders: ["webgpu", "wasm"],
+      },
+    );
     return { ort, session };
   })();
   return ortPromise;
 }
 
-const work = typeof document !== "undefined" ? document.createElement("canvas") : null;
+const work =
+  typeof document !== "undefined" ? document.createElement("canvas") : null;
 
 // src is the already cropped match canvas. Returned boxes are in src pixel coordinates.
 export async function detect(src: HTMLCanvasElement): Promise<Detections> {
@@ -55,7 +69,12 @@ export async function detect(src: HTMLCanvasElement): Promise<Detections> {
     input[2 * plane + i] = data[i * 4 + 2] / 255;
   }
   const out = await session.run({
-    [session.inputNames[0]]: new ort.Tensor("float32", input, [1, 3, SIZE, SIZE]),
+    [session.inputNames[0]]: new ort.Tensor("float32", input, [
+      1,
+      3,
+      SIZE,
+      SIZE,
+    ]),
   });
   const raw = out[session.outputNames[0]].data as Float32Array;
   const n = out[session.outputNames[0]].dims[2];
@@ -87,7 +106,12 @@ export async function detect(src: HTMLCanvasElement): Promise<Detections> {
   }
   const goalkeepers = nms(keepers);
   // players includes goalkeepers so callers that only read players still see them.
-  return { players: [...nms(outfield), ...goalkeepers], goalkeepers, referees: nms(refs), ball };
+  return {
+    players: [...nms(outfield), ...goalkeepers],
+    goalkeepers,
+    referees: nms(refs),
+    ball,
+  };
 }
 
 function iou(a: Box, b: Box) {

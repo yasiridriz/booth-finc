@@ -4,6 +4,7 @@
 // The keypoints give a homography from frame pixels to pitch metres.
 import type { Box } from "./detector";
 import { PITCH_VERTICES } from "./pitchConfig";
+import { asset } from "./assets";
 
 export type Pitch = { toPitch(x: number, y: number): [number, number] };
 
@@ -15,25 +16,35 @@ const L = 105;
 const W = 68;
 
 type Ort = typeof import("onnxruntime-web/all");
-let ortPromise: Promise<{ ort: Ort; session: import("onnxruntime-web/all").InferenceSession }> | null = null;
+let ortPromise: Promise<{
+  ort: Ort;
+  session: import("onnxruntime-web/all").InferenceSession;
+}> | null = null;
 
 export function loadPitch() {
   ortPromise ??= (async () => {
     const ort = await import("onnxruntime-web/all");
     ort.env.logLevel = "error";
-    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/";
-    const session = await ort.InferenceSession.create("/models/pitch.onnx", {
-      executionProviders: ["webgpu", "wasm"],
-    });
+    ort.env.wasm.wasmPaths =
+      "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/";
+    const session = await ort.InferenceSession.create(
+      asset("/models/pitch.onnx"),
+      {
+        executionProviders: ["webgpu", "wasm"],
+      },
+    );
     return { ort, session };
   })();
   return ortPromise;
 }
 
-const work = typeof document !== "undefined" ? document.createElement("canvas") : null;
+const work =
+  typeof document !== "undefined" ? document.createElement("canvas") : null;
 
 // src is the already cropped match canvas. Returns null when the pitch can't be located.
-export async function locatePitch(src: HTMLCanvasElement): Promise<Pitch | null> {
+export async function locatePitch(
+  src: HTMLCanvasElement,
+): Promise<Pitch | null> {
   const { ort, session } = await loadPitch();
   work!.width = SIZE;
   work!.height = SIZE;
@@ -56,7 +67,12 @@ export async function locatePitch(src: HTMLCanvasElement): Promise<Pitch | null>
     input[2 * plane + i] = data[i * 4 + 2] / 255;
   }
   const out = await session.run({
-    [session.inputNames[0]]: new ort.Tensor("float32", input, [1, 3, SIZE, SIZE]),
+    [session.inputNames[0]]: new ort.Tensor("float32", input, [
+      1,
+      3,
+      SIZE,
+      SIZE,
+    ]),
   });
   const raw = out[session.outputNames[0]].data as Float32Array;
   const n = out[session.outputNames[0]].dims[2];
@@ -77,7 +93,10 @@ export async function locatePitch(src: HTMLCanvasElement): Promise<Pitch | null>
     const row = 5 + k * 3;
     if (raw[(row + 2) * n + best] <= KP_MIN) continue;
     // Undo the letterbox so the fit works in src pixels.
-    from.push([(raw[row * n + best] - ox) / scale, (raw[(row + 1) * n + best] - oy) / scale]);
+    from.push([
+      (raw[row * n + best] - ox) / scale,
+      (raw[(row + 1) * n + best] - oy) / scale,
+    ]);
     to.push(PITCH_VERTICES[k]);
   }
   if (from.length < 4) return null;
@@ -130,7 +149,10 @@ function normalizer(pts: [number, number][]): { T: Mat; inv: Mat } {
 }
 
 // Normalized DLT with h33 = 1, least squares via normal equations.
-function fitHomography(from: [number, number][], to: [number, number][]): Mat | null {
+function fitHomography(
+  from: [number, number][],
+  to: [number, number][],
+): Mat | null {
   const a = normalizer(from);
   const b = normalizer(to);
   const AtA = Array.from({ length: 8 }, () => new Array(9).fill(0)); // last column is At*b
@@ -158,7 +180,8 @@ function solve(M: number[][]): number[] | null {
   const n = M.length;
   for (let c = 0; c < n; c++) {
     let p = c;
-    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    for (let r = c + 1; r < n; r++)
+      if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
     if (Math.abs(M[p][c]) < 1e-12) return null;
     [M[c], M[p]] = [M[p], M[c]];
     for (let r = c + 1; r < n; r++) {
@@ -192,10 +215,16 @@ function onPitch([x, y]: [number, number]) {
 }
 
 // Short plain-words hint, e.g. "ball in right penalty box; 4 players in right penalty box; 2 in left third".
-export function describe(pitch: Pitch, det: { players: Box[]; ball: Box | null }): string {
+export function describe(
+  pitch: Pitch,
+  det: { players: Box[]; ball: Box | null },
+): string {
   const parts: string[] = [];
   if (det.ball) {
-    const p = pitch.toPitch(det.ball.x + det.ball.w / 2, det.ball.y + det.ball.h / 2);
+    const p = pitch.toPitch(
+      det.ball.x + det.ball.w / 2,
+      det.ball.y + det.ball.h / 2,
+    );
     if (onPitch(p)) parts.push(`ball in ${zoneOf(p)}`);
   }
   const counts = new Map<string, number>();
@@ -207,7 +236,9 @@ export function describe(pitch: Pitch, det: { players: Box[]; ball: Box | null }
   }
   const sorted = [...counts].sort((a, b) => b[1] - a[1]);
   sorted.forEach(([z, c], i) => {
-    parts.push(i === 0 ? `${c} player${c === 1 ? "" : "s"} in ${z}` : `${c} in ${z}`);
+    parts.push(
+      i === 0 ? `${c} player${c === 1 ? "" : "s"} in ${z}` : `${c} in ${z}`,
+    );
   });
   return parts.join("; ");
 }
