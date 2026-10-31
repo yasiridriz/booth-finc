@@ -18,14 +18,29 @@ const DEFAULT_CLUBS =
   "Arsenal (London, Premier League), Tottenham Hotspur (London, Premier League)";
 const TOPIC_REFRESH_MS = 5 * 60 * 1000;
 const FILLER_CHECK_MS = 1500; // how often to ask whether a gap line is needed
+const QUIET_BEFORE_FILLER_MS = 4000; // silence needed before a filler is asked for
 const DEFAULT_URL = "https://www.youtube.com/watch?v=D29dNXViqJw";
 const DETECT_FPS = 5;
 const RING_SIZE = 4;
+// Reads overlap so a moment never waits long for the next one to leave. Each takes about 2.5 s.
+const MAX_IN_FLIGHT = 2;
+const SEND_GAP_MS = 1100;
 const RING_GAP_MS = 500;
 const PITCH_EVERY_MS = 1000;
 const DELAY_S = 4; // broadcast delay: analysis runs this far ahead; calls measured at 2.4-2.9s to make
 const EARLY_S = 0.2; // a timed line may start this much before its moment
 const LATE_S = 2.5; // a timed line this late is stale and dropped
+
+const MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+// Finds a match date in a video title: "12/2/2018" (US order, as US broadcasters post) or "2 December 2018".
+function dateFromTitle(title: string): string | null {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const us = title.match(/\b(\d{1,2})\/(\d{1,2})\/((?:19|20)\d{2})\b/);
+  if (us) return `${us[3]}-${pad(+us[1])}-${pad(+us[2])}`;
+  const long = title.toLowerCase().match(/\b(\d{1,2})(?:st|nd|rd|th)? (january|february|march|april|may|june|july|august|september|october|november|december),? ((?:19|20)\d{2})\b/);
+  if (long) return `${long[3]}-${pad(MONTHS.indexOf(long[2]) + 1)}-${pad(+long[1])}`;
+  return null;
+}
 
 function videoId(url: string) {
   return url.match(/(?:v=|youtu\.be\/|embed\/|live\/)([\w-]{11})/)?.[1] ?? null;
@@ -54,7 +69,8 @@ export default function Host() {
   const streamVideo = useRef<HTMLVideoElement>(null);
   const crop = useRef<HTMLCanvasElement>(null);
   const preview = useRef<HTMLCanvasElement>(null);
-  const busy = useRef(false);
+  const visionCalls = useRef(0); // vision calls running now
+  const lastSend = useRef(0);
   const ring = useRef<{ t: number; c: HTMLCanvasElement }[]>([]);
   const [log, setLog] = useState<string[]>([]);
   const trigger = useRef(new TriggerState());
@@ -73,6 +89,9 @@ export default function Host() {
   const refreshTopics = useAction(api.topics.refresh);
   const nextLine = useAction(api.commentary.next);
   const [clubs, setClubs] = useState(DEFAULT_CLUBS);
+  // YYYY-MM-DD of a past match being replayed, so talking points come from that time. Empty means live: today's news.
+  const [matchDate, setMatchDate] = useState("");
+  const dateTouched = useRef(false);
   const [topicNote, setTopicNote] = useState("");
   const [gapNote, setGapNote] = useState("gap lines: waiting");
   const saveRoster = useMutation(api.booth.setRoster);
@@ -97,6 +116,7 @@ export default function Host() {
     .flatMap((l) => l.match(/^\s*\d+\s+(.+)$/)?.[1] ?? []);
   const topics = useQuery(api.topics.ranked, { focus });
   const audioPlaying = useRef(false);
+  const lastAudioEnd = useRef(0); // when the booth last went quiet
   const current = useRef<HTMLAudioElement | null>(null);
   const queue = useRef<
     { url: string; priority: number; ttl: number; seenAt: number; vt?: number }[]
@@ -282,11 +302,13 @@ export default function Host() {
             ballMs: ballWorker.current.ms,
           }));
 
-          if (t && !busy.current && ring.current.length) {
-            busy.current = true;
-            // Older frames show motion at 640px. The newest is sent sharp, since players are tiny in wide shots.
+          if (t && visionCalls.current < MAX_IN_FLIGHT && now - lastSend.current >= SEND_GAP_MS && ring.current.length) {
+            visionCalls.current += 1;
+            lastSend.current = now;
+            // Two older frames show motion at 640px; the newest is sharper, since players are tiny in wide shots.
+            // Fewer, smaller images make the model answer faster.
             const sharp = document.createElement("canvas");
-            const k = Math.min(1, 1280 / c.width);
+            const k = Math.min(1, 960 / c.width);
             sharp.width = Math.round(c.width * k);
             sharp.height = Math.round(c.height * k);
             sharp
@@ -294,9 +316,9 @@ export default function Host() {
               .drawImage(c, 0, 0, sharp.width, sharp.height);
             const frames = [
               ...ring.current
-                .slice(1)
+                .slice(-3, -1)
                 .map((f) => f.c.toDataURL("image/jpeg", 0.6).split(",")[1]),
-              sharp.toDataURL("image/jpeg", 0.85).split(",")[1],
+              sharp.toDataURL("image/jpeg", 0.8).split(",")[1],
             ];
             // The video moment these frames show, so link mode can play the call exactly then.
             const vt = source === "link" ? clipVideo.current?.currentTime : undefined;
@@ -309,7 +331,7 @@ export default function Host() {
                 console.error(e);
                 setStats((s) => ({ ...s, last: "error" }));
               })
-              .finally(() => (busy.current = false));
+              .finally(() => (visionCalls.current -= 1));
           }
         }
       } catch (e) {
@@ -333,7 +355,7 @@ export default function Host() {
   useEffect(() => {
     if (!capturing || clubList.length === 0) return;
     const run = () =>
-      refreshTopics({ clubs: clubList, players: playersRef.current })
+      refreshTopics({ clubs: clubList, players: playersRef.current, matchDate: matchDate || undefined })
         .then((r) => setTopicNote(`${r.added} new from ${r.results} results`))
         .catch((e) =>
           setTopicNote(
@@ -345,14 +367,11 @@ export default function Host() {
     let inFlight = false;
     const filler = setInterval(() => {
       const playing = clipVideo.current ? !clipVideo.current.paused : true;
-      const a = current.current;
-      const remaining =
-        a && Number.isFinite(a.duration) ? a.duration - a.currentTime : 0;
-      // Ask for the next gap line when the queue is empty and the audio is almost done, so there is no dead air.
-      const idleSoon = !audioPlaying.current || remaining < 1.5;
+      // Real broadcasts breathe: ask for a gap line only after a few seconds of silence.
+      const idleSoon = !audioPlaying.current && Date.now() - lastAudioEnd.current > QUIET_BEFORE_FILLER_MS;
       if (
+        // Event calls are not waited for here: the queue already holds a filler when a timed call is due.
         inFlight ||
-        busy.current ||
         !playing ||
         queue.current.length ||
         !idleSoon
@@ -378,7 +397,7 @@ export default function Host() {
       clearInterval(filler);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [capturing, clubs, refreshTopics, nextLine]);
+  }, [capturing, clubs, matchDate, refreshTopics, nextLine]);
 
   // Lines wait in a queue. The highest priority plays first, and a line that waited too long is dropped.
   const pump = useCallback(function run() {
@@ -401,6 +420,7 @@ export default function Host() {
     audioPlaying.current = true;
     const done = () => {
       audioPlaying.current = false;
+      lastAudioEnd.current = Date.now();
       current.current = null;
       run();
     };
@@ -481,6 +501,14 @@ export default function Host() {
         const view = viewerVideo.current;
         if (view && !offset && Number.isFinite(view.duration)) availS.current = (j.have / j.size) * view.duration;
         setDownload(j.error && !j.downloading ? `Video error: ${j.error}` : "");
+        // Classic-match uploads put the date in the title, e.g. "FULL MATCH | 12/2/2018" or "2 December 2018".
+        if (!dateTouched.current && j.title) {
+          const d = dateFromTitle(j.title);
+          if (d) {
+            dateTouched.current = true;
+            setMatchDate(d);
+          }
+        }
       } catch {}
     }, 2000);
     return () => {
@@ -650,7 +678,11 @@ export default function Host() {
                   {lines.map((l, index) => (
                     <li key={l._id} className={`commentary-line ${l.event === "goal" ? "goal-line" : ""}`}>
                       <div className="mb-3 flex items-center justify-between gap-2">
-                        <span className="event-badge" data-event={l.event}>{l.event === "goal" && <span aria-hidden="true">⚽ </span>}{l.event}</span>
+                        <span className="flex items-center gap-2">
+                          <span className="event-badge" data-event={l.event}>{l.event === "goal" && <span aria-hidden="true">⚽ </span>}{l.event}</span>
+                          {/* Two people in the booth: the chosen style calls the action, the co-commentator analyses. */}
+                          <span className="eyebrow text-muted">{l.persona.startsWith("co:") ? "Co-commentator" : "Caller"}</span>
+                        </span>
                         {index === 0 && <span className="latest-label">Latest call</span>}
                       </div>
                       <p>{l.text}</p>
@@ -700,6 +732,14 @@ export default function Host() {
               <label className="block text-sm text-muted">
                 Clubs for talking points (name, town, league; comma separated)
                 <input className="engine-input mt-2" value={clubs} onChange={(e) => setClubs(e.target.value)} />
+              </label>
+              <label className="mt-4 block text-sm text-muted">
+                Match date for a replayed match (YYYY-MM-DD; empty = live, today&apos;s news)
+                <input className="engine-input mt-2" value={matchDate} placeholder="2018-12-02"
+                  onChange={(e) => {
+                    dateTouched.current = true;
+                    setMatchDate(e.target.value.trim());
+                  }} />
               </label>
               <details className="lineup-box mt-4">
                 <summary>Lineup <span className="text-xs text-muted">Team name, then “number name” per line</span></summary>

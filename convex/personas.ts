@@ -104,3 +104,34 @@ export function isStyle(x: string): x is StyleId {
 export function isLang(x: string): x is Lang {
   return LANGUAGES.some((entry) => entry.id === x);
 }
+
+// Every line must say something real. Applied to the caller, the co-commentator and every filler.
+export const SUBSTANCE =
+  "Every line must carry a concrete fact: a team name, a player name, a place on the pitch, the score, a time or a stat. Name a team in every line, by name, never by shirt colour. Name a player whenever the frame, an on-screen caption, the note or the lineup identifies them; never guess. No filler and no stock phrases: never say things like 'the tension is electric', 'the crowd is on its feet', 'what a moment', 'scrambling to shut the door', 'nothing settled yet', 'bodies everywhere', 'this one could go either way', 'keep your eyes peeled' or 'folks'. Do not describe atmosphere or invent drama the facts do not show. Short and plain beats clever.";
+
+// The second voice in the booth. The chosen style is the main caller on live action; the co-commentator
+// takes quiet moments, replays and analysis, and talks with the caller, which is what makes it a conversation.
+const CO_SYSTEM =
+  "You are the co-commentator: the expert analyst sitting next to the main caller. You do not call live action; you react to it. Answer or build on what your partner just said (agree, push back, add the why), explain what is happening tactically, read the momentum, and now and then speak to your partner directly. Keep it natural and conversational, max 14 words. Never repeat a line already said. Keep facts to what is given; never invent names, scores or events. No stage directions.";
+
+// Co-commentator voices, in order of preference; the first one that differs from the caller's voice is used.
+const CO_VOICES = [
+  "onwK4e9ZLuTAKqWW03F9", // Daniel: steady broadcaster
+  "JBFqnCBsd6RMkjVDRZzb", // George: warm storyteller
+];
+
+export function coPrompt(lang: Lang): string {
+  const language = LANGUAGES.find((entry) => entry.id === lang);
+  if (!language) throw new Error("Unknown commentary language");
+  return `${CO_SYSTEM}\n\n${language.instruction}`;
+}
+
+export function coVoice(style: StyleId): string {
+  const caller = STYLES.find((entry) => entry.id === style)?.voiceId;
+  return CO_VOICES.find((v) => v !== caller) ?? CO_VOICES[0];
+}
+
+// Who said a line, from the persona field stored on it ("co:en" or "<style>:<lang>").
+export function speakerOf(persona: string): "co" | "caller" {
+  return persona.startsWith("co:") ? "co" : "caller";
+}

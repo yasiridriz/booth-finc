@@ -4,7 +4,7 @@ import { v } from "convex/values";
 import Anthropic from "@anthropic-ai/sdk";
 import { classify, textOf } from "./vision";
 import { synthesizeCommentary } from "../lib/commentaryVoice";
-import { DEFAULT_LANG, DEFAULT_STYLE, STYLES, isLang, isStyle, personaPrompt, type Lang, type StyleId } from "./personas";
+import { DEFAULT_LANG, DEFAULT_STYLE, STYLES, SUBSTANCE, coPrompt, coVoice, isLang, isStyle, personaPrompt, speakerOf, type Lang, type StyleId } from "./personas";
 
 const MODEL = "claude-haiku-5-5"; // writes the spoken line, where speed matters most
 const LIVE_VOICE_MODEL = "eleven_flash_v2_5";
@@ -13,12 +13,13 @@ const VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM";
 
 // Shared rules for event calls. The style and language come first from convex/personas.ts and set the voice.
 const PERSONA =
-  "One or two punchy calls, max 20 words (a haiku style may use its own form). Use rhythm and vivid verbs, and vary them so no two calls sound alike. React only to the supplied observation; never invent teams, scores or outcomes. Name a player only if the observation already names them; never guess a name. Refer to a team by its name from the match line, not by shirt colour (the kit colours in the match line tell you which colour is which team). Never mention what did not happen (no 'no shot', 'no goal'). Vary your wording. No stage directions or audio tags; delivery is added separately.";
+  `Live play-by-play: ONE short burst, max 10 words, like a real commentator calling the action as it happens. Only a goal gets two short bursts, max 16 words in all (a haiku style may use its haiku for a goal only). These limits override any length your persona mentions. ${SUBSTANCE} Use rhythm and vivid verbs, and vary them so no two calls sound alike. React only to the supplied observation; never invent teams, scores or outcomes. Name a player only if the observation already names them; never guess a name. Refer to a team by its name from the match line, not by shirt colour (the kit colours in the match line tell you which colour is which team). Never mention what did not happen (no 'no shot', 'no goal'). Vary your wording. No stage directions or audio tags; delivery is added separately.`;
 
 // Big moments are always called. Minor ones only fill silence.
 const BIG = new Set(["goal", "shot", "save", "foul", "celebration", "penalty", "handball", "card"]);
 const QUIET_MS = 10000;
 const REPEAT_MS = 20000;
+const GOAL_REPEAT_MS = 15000; // a goal is long enough to be read several times, but two goals are never this close
 
 const goals = (score: string) => score.split("-").reduce((a, b) => a + Number(b), 0);
 
@@ -45,6 +46,15 @@ export const latest = query({
   handler: async (ctx) => ctx.db.query("lines").order("desc").take(10),
 });
 
+// The last lines actually spoken, oldest first, so each new line can continue the conversation.
+export const recentSpoken = internalQuery({
+  args: {},
+  handler: async (ctx): Promise<string[]> => {
+    const rows = await ctx.db.query("lines").order("desc").take(6);
+    return rows.reverse().map((r) => `${speakerOf(r.persona) === "co" ? "Co-commentator" : "Caller"}: ${r.text}`);
+  },
+});
+
 // Starts a fresh match: forgets the score and clears the commentary feed. Samples are kept for the bench.
 export const resetMatch = mutation({
   args: {},
@@ -55,6 +65,21 @@ export const resetMatch = mutation({
     for await (const row of ctx.db.query("memory")) await ctx.db.delete("memory", row._id);
     // Talking points belong to the clubs of the last match.
     for await (const row of ctx.db.query("topics")) await ctx.db.delete("topics", row._id);
+  },
+});
+
+// One celebration or goal spans many reads, so the same event is called once per window.
+export const claimCall = internalMutation({
+  args: { event: v.string() },
+  handler: async (ctx, { event }): Promise<boolean> => {
+    const row = await ctx.db.query("state").first();
+    const now = Date.now();
+    const last = row?.lastCall;
+    const window = event === "goal" ? GOAL_REPEAT_MS : REPEAT_MS;
+    if (last && last.event === event && now - last.at < window) return false;
+    if (row) await ctx.db.patch("state", row._id, { lastCall: { event, at: now } });
+    else await ctx.db.insert("state", { score: null, lastCall: { event, at: now } });
+    return true;
   },
 });
 
@@ -181,10 +206,11 @@ export const processFrame = action({
     const t0 = Date.now();
     const match = await ctx.runQuery(internal.booth.getState, {});
     const earlier: string[] = await ctx.runQuery(internal.memory.recent, {});
+    const spoken: string[] = await ctx.runQuery(internal.booth.recentSpoken, {});
     // The vision call also writes the spoken line, so a call needs one model round trip, not two.
     const speak = {
       system: `${personaPrompt(match.style, match.lang)}\n\nRules: ${PERSONA}`,
-      context: `Match: ${match.teams ?? "teams as identified above"}, score ${match.score ?? "as on the scoreboard"}. ${earlier.length ? `Earlier in this match (use for a storyline only when it truly connects): ${earlier.join("; ")}. ` : ""}Let the danger level in the game state set your intensity.`,
+      context: `Match: ${match.teams ?? "teams as identified above"}, score ${match.score ?? "as on the scoreboard"}. ${earlier.length ? `Earlier in this match (use for a storyline only when it truly connects): ${earlier.join("; ")}. ` : ""}${spoken.length ? `The broadcast so far, oldest first (carry it on: react to it or build on it, never repeat or rephrase it): ${spoken.join(" / ")}. ` : ""}Let the danger level in the game state set your intensity.`,
     };
     const reading = await classify(client, VISION_MODEL, frames, hint, match.teams, match.roster, speak);
     const ms = Date.now() - t0;
@@ -230,21 +256,24 @@ export const processFrame = action({
         await saveSample();
         return { event, note, score };
       }
-      // Sampling is continuous, so one celebration spans many reads. Call it once.
-      if (event !== "goal" && event === last.event && age < REPEAT_MS) {
-        await saveSample();
-        return { event, note, score };
-      }
+    }
+    // Two reads are in flight at once and overlap in time, so the same moment can come back twice.
+    // Claiming the call in one transaction lets only the first one speak.
+    if (!(await ctx.runMutation(internal.booth.claimCall, { event }))) {
+      await saveSample();
+      return { event, note, score };
     }
 
+    // Replays go to the co-commentator, who breaks down what happened; live action stays with the caller.
+    const co = event === "replay";
     // Use the line written with the frames, unless the event changed after the read (a score change made it a goal).
-    let text = event === reading.event ? reading.line : "";
+    let text = !co && event === reading.event ? reading.line : "";
     if (!text) {
       const speech = await client.messages.create({
         model: MODEL,
         max_tokens: 120,
         thinking: { type: "disabled" },
-        system: speak.system,
+        system: co ? `${coPrompt(match.lang)}\n\nTask: the broadcast is showing a replay. Break down what it shows and why it mattered, in reply to your partner.` : speak.system,
         messages: [
           {
             role: "user",
@@ -256,12 +285,13 @@ export const processFrame = action({
     }
 
     // Live calls use the low-latency voice model (about 0.4s against 1.1s); the energy comes from the words.
-    const speechAudio = await synthesizeCommentary(text, event, STYLES.find((s) => s.id === match.style)?.voiceId, LIVE_VOICE_MODEL);
+    const voiceId = co ? coVoice(match.style) : STYLES.find((s) => s.id === match.style)?.voiceId;
+    const speechAudio = await synthesizeCommentary(text, event, voiceId, LIVE_VOICE_MODEL);
     const audioId = await ctx.storage.store(speechAudio.audio);
     const audioUrl = (await ctx.storage.getUrl(audioId)) ?? undefined;
 
     await ctx.runMutation(internal.booth.insertLine, {
-      persona: `${match.style}:${match.lang}`,
+      persona: co ? `co:${match.lang}` : `${match.style}:${match.lang}`,
       event,
       text,
       audioUrl,

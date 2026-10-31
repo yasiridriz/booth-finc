@@ -49,5 +49,6 @@ export default defineSchema({
     roster: v.optional(v.string()), // pasted lineup: team heading, then "number name" lines
     style: v.optional(v.string()), // commentating style id from convex/personas.ts
     lang: v.optional(v.string()), // commentary language id from convex/personas.ts
+    lastCall: v.optional(v.object({ event: v.string(), at: v.number() })), // last event call claimed, so overlapping reads never both speak
   }),
 });

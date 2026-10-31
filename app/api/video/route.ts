@@ -15,7 +15,7 @@ const DIR = path.join(process.cwd(), ".cache", "videos");
 const CHUNK = 4 * 1024 * 1024;
 const WAIT_MS = 60_000; // how long a request waits for bytes that have not downloaded yet
 
-type Job = { file: string; size: number; proc: ChildProcess | null; error: string | null };
+type Job = { file: string; size: number; title: string; proc: ChildProcess | null; error: string | null };
 const jobs = new Map<string, Promise<Job>>();
 
 function start(link: string): Promise<Job> {
@@ -30,7 +30,7 @@ function start(link: string): Promise<Job> {
     if (!size) throw new Error("yt-dlp gave no file size for this video");
     mkdirSync(DIR, { recursive: true });
     const file = path.join(DIR, `${info.id}.${info.ext ?? "mp4"}`);
-    const j: Job = { file, size, proc: null, error: null };
+    const j: Job = { file, size, title: String(info.title ?? ""), proc: null, error: null };
     if (existsSync(file) && statSync(file).size >= size) return j;
     // yt-dlp grows <file>.part and renames it when done; it resumes a .part left by an earlier run.
     j.proc = spawn("yt-dlp", ["-q", "--no-playlist", "-f", FORMAT, "-o", file, link]);
@@ -122,9 +122,12 @@ export async function GET(request: Request) {
     return new Response(tail(sec, request.signal), { headers: { "content-type": "video/mp4" } });
   }
 
+  // yt-dlp's size is an estimate; once the download is done, the file on disk is the truth.
+  if (!job.proc && existsSync(job.file)) job.size = statSync(job.file).size;
+
   // The page polls this to show download progress.
   if (params.has("status")) {
-    return Response.json({ have: have(job.file), size: job.size, downloading: !!job.proc, error: job.error });
+    return Response.json({ have: have(job.file), size: job.size, downloading: !!job.proc, error: job.error, title: job.title });
   }
 
   const m = /bytes=(\d+)-(\d*)/.exec(request.headers.get("range") ?? "");

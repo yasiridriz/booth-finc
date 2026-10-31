@@ -4,14 +4,14 @@ import { v } from "convex/values";
 import Anthropic from "@anthropic-ai/sdk";
 import { textOf } from "./vision";
 import { synthesizeCommentary } from "../lib/commentaryVoice";
-import { STYLES, personaPrompt } from "./personas";
+import { SUBSTANCE, coPrompt, coVoice } from "./personas";
 
 const MODEL = "claude-haiku-5-5";
 const MIN_AFTER_LINE_MS = 1_500; // the page also waits for the audio to be nearly done
-const MIN_FILLER_GAP_MS = 4_000; // keeps the gap fillers from becoming chatter
+const MIN_FILLER_GAP_MS = 15_000; // real broadcasts leave silence; at most one filler per 15 s
 
 type Kind = "color" | "fact" | "memory" | "banter";
-// Banter is not in the rotation. It is the fallback that needs no data, so a gap is never left empty.
+// Banter needs no data, so it is never used: when there is nothing real to say, the booth stays quiet.
 const ROTATION: Kind[] = ["color", "fact", "memory"];
 // priority: the page plays the highest first. ttl: how long a line may wait in the page's queue.
 const SETTINGS: Record<Kind, { priority: number; ttlMs: number }> = {
@@ -22,13 +22,13 @@ const SETTINGS: Record<Kind, { priority: number; ttlMs: number }> = {
 };
 
 const COLOR_SYSTEM =
-  "You are a live football commentator in a lull. Give ONE short observation about how the game is flowing, max 22 words, using only the game read you are given. Be hyped and high-energy: punchy, excited, like the crowd is roaring. Name the teams from the match line; never say shirt colours alone. Do not announce a shot, goal, foul or save unless it is in the recent events. Do not repeat or rephrase your earlier lines. No stage directions.";
+  "You are a live football commentator in a lull. Give ONE short observation about how the game is going, max 12 words, using only the game read you are given: who has the ball, where, and who is on top. Name the teams from the match line; never say shirt colours alone. Do not announce a shot, goal, foul or save unless it is in the recent events. Do not repeat or rephrase your earlier lines. No stage directions.";
 const MEMORY_SYSTEM =
-  "You are a live football commentator. Bring back ONE earlier moment of this match, max 26 words, using only the note and its age ('about N minutes ago'). Tie it to the present only if the game read supports it. Be hyped and high-energy: punchy, excited, like the crowd is roaring. Add no detail that is not in the note. No stage directions.";
+  "You are a live football commentator. Bring back ONE earlier moment of this match, max 16 words, using only the note and its age ('about N minutes ago'). Tie it to the present only if the game read supports it. Add no detail that is not in the note. No stage directions.";
 const BANTER_SYSTEM =
   "You are an electric, hyped-up live football commentator filling a quiet second. Max 22 words. Build anticipation with ONE of: a prediction about what comes next, a question to the fans, or a remark about the atmosphere or the tempo. Use only the match line and recent events; claim no shot, goal, foul or save, and no facts about players or clubs. Vary your style and never repeat or rephrase your earlier lines. No stage directions.";
 const FACT_SYSTEM =
-  "You are a live football commentator in a quiet moment of play. Say ONE talking point from the note you are given, max 28 words, with big energy. Use only the facts in the note; add nothing. Attribute it naturally ('according to ...', 'reportedly') when the note names a source. Never say it is breaking news unless the note says it is from the last day. No stage directions.";
+  "You are a live football commentator in a quiet moment of play. Say ONE talking point from the note you are given, max 20 words. Use only the facts in the note; add nothing. Attribute it naturally ('according to ...', 'reportedly') when the note names a source. Never say it is breaking news unless the note says it is from the last day. No stage directions.";
 
 export const gate = internalQuery({
   args: {},
@@ -92,6 +92,7 @@ export const next = action({
     });
     const match = await ctx.runQuery(internal.booth.getState, {});
     const earlier: string[] = await ctx.runQuery(internal.memory.recent, {});
+    const spoken: string[] = await ctx.runQuery(internal.booth.recentSpoken, {});
     const matchLine = `Match: ${match.teams ?? "unknown teams"}, score ${match.score ?? "unknown"}.`;
 
     // Start after the kind used last, so the three take turns.
@@ -99,7 +100,6 @@ export const next = action({
     const start = last < 0 ? 0 : (last + 1) % ROTATION.length;
     const order: Kind[] = [
       ...ROTATION.map((_, i) => ROTATION[(start + i) % ROTATION.length]),
-      "banter",
     ];
     for (const kind of order) {
       let system: string;
@@ -128,20 +128,25 @@ export const next = action({
         model: MODEL,
         max_tokens: 120,
         thinking: { type: "disabled" },
-        // The persona sets voice, energy and language; the task prompt sets what to say.
-        system: `${personaPrompt(match.style, match.lang)}\n\nTask (your persona overrides any energy level it mentions): ${system}`,
-        messages: [{ role: "user", content: user }],
+        // Gap lines belong to the co-commentator, who talks with the caller. The task sets what to say.
+        system: `${coPrompt(match.lang)}\n\nTask (your role overrides any energy level it mentions): ${system}\n\nRules: ${SUBSTANCE}`,
+        messages: [
+          {
+            role: "user",
+            content: `${user}\n${spoken.length ? `The broadcast so far, oldest first (reply to or build on the last line when it fits; never repeat or rephrase any of it): ${spoken.join(" / ")}` : ""}`,
+          },
+        ],
       });
       const text = textOf(res.content);
       const voice = await synthesizeCommentary(
         text,
         kind === "banter" ? "banter" : "color",
-        STYLES.find((s) => s.id === match.style)?.voiceId,
+        coVoice(match.style),
       );
       const audioId = await ctx.storage.store(voice.audio);
       const audioUrl = (await ctx.storage.getUrl(audioId)) ?? undefined;
       await ctx.runMutation(internal.booth.insertLine, {
-        persona: `${match.style}:${match.lang}`,
+        persona: `co:${match.lang}`,
         event: kind,
         text,
         audioUrl,

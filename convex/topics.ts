@@ -179,6 +179,17 @@ async function firecrawl(
   );
 }
 
+// For a replay of an old match: Google's custom date range, the 30 days up to the match, then 90 if too little came back.
+const usDate = (d: Date) => `${d.getUTCMonth() + 1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
+async function searchBefore(query: string, matchDay: Date): Promise<Hit[]> {
+  const range = (days: number) =>
+    `cdr:1,cd_min:${usDate(new Date(matchDay.getTime() - days * 86_400_000))},cd_max:${usDate(matchDay)}`;
+  const month = await firecrawl(query, range(30));
+  if (month.length >= MIN_RESULTS) return month.map((h) => ({ ...h, window: "week" as const }));
+  const quarter = await firecrawl(query, range(90));
+  return quarter.map((h) => ({ ...h, window: "month" as const }));
+}
+
 // Hard date filter first (the part that keeps results recent), then a wider one only if too little came back.
 async function searchRecent(query: string): Promise<Hit[]> {
   const week = await firecrawl(query, "qdr:w");
@@ -191,8 +202,8 @@ async function searchRecent(query: string): Promise<Hit[]> {
 const kindsList =
   "transfer or contract, injury or fitness, recent form and stats, manager or player quote, social media banter, rivalry or head-to-head, milestone or record, widely reported controversy";
 
-function querySystem(today: string, monthYear: string) {
-  return `Today is ${today}. You write web search queries for a live football commentary team. They must surface things published in the LAST 7 DAYS only.
+function querySystem(today: string, monthYear: string, historic: boolean) {
+  return `Today is ${today}${historic ? " (match day of a past match being replayed; write as if it is that day)" : ""}. You write web search queries for a live football commentary team. They must surface things published in the ${historic ? "30 DAYS BEFORE that date" : "LAST 7 DAYS"} only.
 Rules:
 - Every query contains a time anchor: "${monthYear}", or words like "this week", "latest", "yesterday". Never use an older year or season.
 - One subject per query (one club or one player). Use the club exactly as the user wrote it, with its town, and "football". Add the league name so another club with a similar name cannot match.
@@ -234,8 +245,17 @@ const host = (u: string) => {
   }
 };
 
+// Wipes all talking points (for example after the search rules change). Run from the CLI.
+export const clearAll = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    for await (const row of ctx.db.query("topics")) await ctx.db.delete("topics", row._id);
+  },
+});
+
 export const refresh = action({
-  args: { clubs: v.array(v.string()), players: v.array(v.string()) },
+  // matchDate (YYYY-MM-DD) replays an old match: news comes from the weeks before that date, not from today.
+  args: { clubs: v.array(v.string()), players: v.array(v.string()), matchDate: v.optional(v.string()) },
   returns: v.object({
     queries: v.number(),
     results: v.number(),
@@ -243,12 +263,13 @@ export const refresh = action({
   }),
   handler: async (
     ctx,
-    { clubs, players },
+    { clubs, players, matchDate },
   ): Promise<{ queries: number; results: number; added: number }> => {
     const client = new Anthropic({
       apiKey: process.env.ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_KEY,
     });
-    const now = new Date();
+    const matchDay = matchDate && /^\d{4}-\d{2}-\d{2}$/.test(matchDate) ? new Date(`${matchDate}T12:00:00Z`) : null;
+    const now = matchDay ?? new Date();
     const today = now.toISOString().slice(0, 10);
     const monthYear = now.toLocaleString("en-US", {
       month: "long",
@@ -260,7 +281,7 @@ export const refresh = action({
       model: MODEL,
       max_tokens: 700,
       thinking: { type: "disabled" },
-      system: querySystem(today, monthYear),
+      system: querySystem(today, monthYear, !!matchDay),
       messages: [
         {
           role: "user",
@@ -277,7 +298,7 @@ export const refresh = action({
 
     const known = new Set(await ctx.runQuery(internal.topics.knownUrls, {}));
     const hits: Hit[] = [];
-    for (const group of await Promise.all(planned.map(searchRecent))) {
+    for (const group of await Promise.all(planned.map((q) => (matchDay ? searchBefore(q, matchDay) : searchRecent(q))))) {
       for (const h of group) {
         // Search-engine pages are not a source a listener can check.
         if (host(h.url).includes("google.")) continue;
@@ -303,7 +324,7 @@ export const refresh = action({
       messages: [
         {
           role: "user",
-          content: `Today is ${today}. Clubs: ${clubs.join(" vs ")}.\n\n${list}`,
+          content: `Today is ${today}. Clubs: ${clubs.join(" vs ")}.${matchDay ? ` This is a replay of a past match: it is match day, BEFORE kick-off. Search date filters are loose, so drop any result that gives or hints at the outcome of this match, anything that happened after ${today}, and any table, stat or story from a different season.` : ""}\n\n${list}`,
         },
       ],
     });
@@ -333,7 +354,8 @@ export const refresh = action({
           detail: o.detail,
           sourceUrl: hit.url,
           sourceName: host(hit.url),
-          publishedAt: Number.isFinite(published) ? published : undefined,
+          // Ranking ages topics against the real clock, so a replayed match drops the old date and uses its window instead.
+          publishedAt: !matchDay && Number.isFinite(published) ? published : undefined,
           window: (o.evergreen === true ? "evergreen" : hit.window) as Window,
           interest: Math.max(0, Math.min(100, Number(o.interest) || 0)),
         },
