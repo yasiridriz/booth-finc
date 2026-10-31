@@ -9,7 +9,7 @@
     "lint": "eslint",
     "voice:test": "node --experimental-strip-types scripts/test-voice.mjs",
     "voice:demo": "node --env-file=.env.local --experimental-strip-types scripts/test-voice.mjs --live",
-    "build:static": "STATIC_EXPORT=1 next build && find out -name \"*.wasm\" -delete && rm -rf out/models out/clips"
+    "build:static": "node scripts/build-static.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.3.0",

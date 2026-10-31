@@ -47,3 +47,4 @@ public/clips/
 
 # Match videos downloaded by app/api/video
 .cache/
+.gstack/

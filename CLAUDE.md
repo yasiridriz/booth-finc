@@ -114,7 +114,6 @@ The aim is no dead air, without overlapping or repeating.
 - **Limits.** The color prompt maps shirt colours to team names through `state.teams`; if the vision model has not identified the teams yet, it may guess.
   Color lines can add small embellishments (for example "chase shadows"). Tighten `COLOR_SYSTEM` if that is a problem.
 
-<<<<<<< Updated upstream
 ### Link mode, broadcast delay, styles (host page, `app/api/video/route.ts`, `convex/personas.ts`)
 - **Paste a link, no screen share.** Source "YouTube link" plays `/api/video?url=<youtube>` in a page `<video>`, so frames are read
   directly. The route runs `yt-dlp` to download the match to `.cache/videos/<id>.mp4.part` (about 14x real time; resumes after a
@@ -131,12 +130,12 @@ The aim is no dead air, without overlapping or repeating.
   work on serverless hosting (e.g. Vercel functions). Host it on a VM/container, or keep it on the demo laptop.
 - **Model files.** `public/models/pitch.onnx` (172 MB) is gitignored (over GitHub's limit); copy it by hand. `football.onnx` and
   `yolov9-ball.onnx` are committed.
-=======
 ### Static deploy (Cloudflare, GitHub Pages, any static host)
 All app code runs in the browser or in Convex, so the site can be plain files.
-- `npm run build:static` sets `STATIC_EXPORT=1` (see `next.config.ts`: it sets `output: "export"` and turns off `cacheComponents`
-  and `partialPrefetching`, which cannot be used with an export), builds into `out/`, then deletes `out/models`, `out/clips`
-  and the bundled ORT `.wasm`. `out/` is about 3 MB. The ORT wasm is loaded from jsdelivr (`ort.env.wasm.wasmPaths`).
+- `npm run build:static` runs `scripts/build-static.mjs`. It sets `STATIC_EXPORT=1` and `NEXT_PUBLIC_STATIC=1` (see `next.config.ts`: it sets
+  `output: "export"` and turns off `cacheComponents` and `partialPrefetching`, which cannot be used with an export). It moves `app/api`
+  aside for the build (a static export cannot hold route handlers) and always puts it back, builds into `out/`, then deletes every
+  `.wasm`, `.onnx` and `.mp4` from `out/`. `out/` is about 3 MB. A static site has no `/api/video`, so it offers only `clip` matches. The ORT wasm is loaded from jsdelivr (`ort.env.wasm.wasmPaths`).
 - The models and the sample clip are too big for hosts with a per-file cap (Cloudflare: 25 MiB). Put `public/models/*` and
   `public/clips/*` on a public bucket (for example Cloudflare R2, with a CORS rule that allows the site origin) and set
   `NEXT_PUBLIC_ASSET_BASE` to its URL. `lib/assets.ts` (`asset()`) adds it to every model and clip URL. Empty means local `/public`.
@@ -144,4 +143,41 @@ All app code runs in the browser or in Convex, so the site can be plain files.
 - Set `NEXT_PUBLIC_CONVEX_URL` to the production Convex URL (`npx convex deploy`), and set the Convex env vars on that
   deployment again (they do not carry over from dev): `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY`, `FIRECRAWL_API_KEY`, `ELEVENLABS_VOICE_ID`.
 - Convex actions are public and have no login. Anyone with the site URL can spend the API keys. Add a passcode before sharing widely.
->>>>>>> Stashed changes
+
+### Demo walkthrough (`components/DemoGuide.tsx`, `lib/matches.ts`)
+Visitors see three steps and no technical controls: 1 pick a match, 2 choose a commentator (the existing `CommentatorPicker`
+panel), 3 kick off.
+- **Match library.** `lib/matches.ts` lists the matches. Each has a title, detail line, `clubs` (name, town, league, for the topic search)
+  and either `link` (YouTube URL played through `/api/video`, needs a Node host with `yt-dlp`) or `clip` (a file under `/clips`).
+  `AVAILABLE` drops `link` matches when `NEXT_PUBLIC_STATIC` is set. To add a match, add an entry; nothing else changes.
+  The first available match is selected before the visitor picks, so one click starts it.
+- **Kick off** (`start()` in `app/page.tsx`, demo mode): clears the previous run (`resetMatch`), starts the pipeline, and plays the
+  video in the same click, because the click is the user gesture that lets the voice play. After kick-off the walkthrough
+  collapses to a "Live now" bar with a "Pick another match" button (a page reload).
+- **Feed.** Before kick-off the commentary feed is empty (`feed` in `app/page.tsx`), so visitors never see lines from an earlier run.
+- **Operator mode.** Open `/?operator` for the full controls: source dropdown, link box, Reset/Flip, engine room, lineup, talking points.
+  In demo mode the engine room stays mounted but hidden, because the vision preview canvas lives inside it.
+- **Dev note.** If new rules in `app/globals.css` do not show up, the dev server's CSS cache is stale. Change the file's content
+  (touching it is not enough) or restart `next dev`.
+
+### Vercel
+- `next.config.ts` sets `NEXT_PUBLIC_STATIC=1` automatically when `VERCEL` is set, because Vercel cannot run `yt-dlp`. The
+  match list then shows only `clip` matches (`AVAILABLE` in `lib/matches.ts`). A `link` match on Vercel gives `502` from `/api/video`.
+- Set `NEXT_PUBLIC_CONVEX_URL` (production URL) and `NEXT_PUBLIC_ASSET_BASE` in the **Vercel** project settings. The asset base is a
+  browser setting; it does nothing in Convex env. The clip must exist at `<base>/clips/<file>`.
+- The Convex production deployment must run the same code as the site. After any change in `convex/`, run `npx convex deploy`.
+  A missing function shows in the browser as `[CONVEX Q(booth:persona)] Server Error`.
+
+### Adding a match (R2 manifest)
+The bucket holds `matches.json` next to `clips/` and `models/`. The demo loads `<NEXT_PUBLIC_ASSET_BASE>/matches.json` and, if it
+has valid entries, shows those matches instead of the built-in list in `lib/matches.ts`. To add a match, upload the video to
+`clips/` and add an entry; no code change or redeploy is needed:
+```json
+[{ "id": "arsenal-spurs", "title": "Arsenal v Tottenham", "detail": "Premier League · Dec 2018",
+   "clubs": "Arsenal (London, Premier League), Tottenham Hotspur (London, Premier League)",
+   "file": "arsenal-spurs.mp4", "lineup": "Arsenal\n1 Petr Cech\n..." }]
+```
+- `file` is a file name only. An entry with a `/` or `\` in `file` is dropped.
+- `lineup` is optional. Kick-off saves it (or clears the saved lineup if the match has none), so names from another match never reach the air.
+- Video files play through the same delayed viewer as a pasted link (the analysis copy runs `DELAY_S` ahead), so the voice matches the picture.
+- The page tries the bucket's `matches.json` first, then the copy deployed with the site (`public/matches.json`), then the built-in list in `lib/matches.ts`. All three hold the same single Arsenal v Tottenham clip (`clips/arsenal-spurs.mp4`) now. R2 serves files with CORS; the bucket needs the CORS rule from the deploy notes.
