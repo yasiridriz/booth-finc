@@ -7,6 +7,8 @@ import { TriggerState } from "@/lib/trigger";
 
 const DEFAULT_URL = "https://www.youtube.com/watch?v=91WI0e0Mf3c";
 const DETECT_FPS = 5;
+const RING_SIZE = 4;
+const RING_GAP_MS = 500;
 
 function videoId(url: string) {
   return url.match(/(?:v=|youtu\.be\/|embed\/|live\/)([\w-]{11})/)?.[1] ?? null;
@@ -123,6 +125,17 @@ export default function Host() {
 
           const det = await detect(c);
           const now = performance.now();
+
+          // Keep the last few frames about 0.5s apart so Haiku sees motion, not one still.
+          const last = ring.current.at(-1);
+          if (!last || now - last.t >= RING_GAP_MS) {
+            const scale = Math.min(1, 640 / c.width);
+            const snap = document.createElement("canvas");
+            snap.width = Math.round(c.width * scale);
+            snap.height = Math.round(c.height * scale);
+            snap.getContext("2d")!.drawImage(c, 0, 0, snap.width, snap.height);
+            ring.current = [...ring.current, { t: now, c: snap }].slice(-RING_SIZE);
+          }
           const t = trigger.current.update(c, det, now);
           drawPreview(det);
           setStats((s) => ({

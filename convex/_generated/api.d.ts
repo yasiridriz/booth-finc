@@ -8,7 +8,9 @@
  * @module
  */
 
+import type * as bench from "../bench.js";
 import type * as booth from "../booth.js";
+import type * as vision from "../vision.js";
 
 import type {
   ApiFromModules,
@@ -17,7 +19,9 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  bench: typeof bench;
   booth: typeof booth;
+  vision: typeof vision;
 }>;
 
 /**
