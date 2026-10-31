@@ -1,14 +1,18 @@
 "use client";
-import { useAction, useQuery } from "convex/react";
+import { useAction, useMutation, useQuery } from "convex/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/convex/_generated/api";
 import { detect, loadDetector, type Detections } from "@/lib/detector";
 import { TriggerState } from "@/lib/trigger";
+import { loadPitch, locatePitch, type Pitch } from "@/lib/pitch";
+import { TeamSplitter, colourName, teamColour } from "@/lib/teams";
+import { GameState, describeRead, type Read, type Team } from "@/lib/game";
 
 const DEFAULT_URL = "https://www.youtube.com/watch?v=91WI0e0Mf3c";
 const DETECT_FPS = 5;
 const RING_SIZE = 4;
 const RING_GAP_MS = 500;
+const PITCH_EVERY_MS = 1000;
 
 function videoId(url: string) {
   return url.match(/(?:v=|youtu\.be\/|embed\/|live\/)([\w-]{11})/)?.[1] ?? null;
@@ -23,6 +27,7 @@ export default function Host() {
     speed: 0,
     cut: 0,
     last: "idle",
+    pitchMs: 0,
   });
   const [model, setModel] = useState("loading model...");
 
@@ -35,14 +40,19 @@ export default function Host() {
   const [log, setLog] = useState<string[]>([]);
   const lastPlayed = useRef<string | null>(null);
   const trigger = useRef(new TriggerState());
+  const splitter = useRef(new TeamSplitter());
+  const game = useRef(new GameState());
+  const pitch = useRef<{ p: Pitch | null; t: number }>({ p: null, t: 0 });
+    const [read, setRead] = useState<{ r: Read; names: [string, string] } | null>(null);
 
   const processFrame = useAction(api.booth.processFrame);
+  const resetMatch = useMutation(api.booth.resetMatch);
   const lines = useQuery(api.booth.latest);
   const id = videoId(url);
 
   useEffect(() => {
-    loadDetector().then(
-      () => setModel("model ready"),
+    Promise.all([loadDetector(), loadPitch()]).then(
+      () => setModel("models ready"),
       (e) => setModel(`model failed: ${e instanceof Error ? e.message : e}`),
     );
   }, []);
@@ -70,7 +80,7 @@ export default function Host() {
     setCapturing(true);
   };
 
-  const drawPreview = useCallback((det: Detections) => {
+  const drawPreview = useCallback((det: Detections, teams: (Team | null)[], outfield: Detections["players"]) => {
     const c = crop.current!;
     const p = preview.current!;
     p.width = c.width;
@@ -79,7 +89,13 @@ export default function Host() {
     ctx.drawImage(c, 0, 0);
     ctx.lineWidth = 2;
     ctx.strokeStyle = "#22d3ee";
-    det.players.forEach((b) => ctx.strokeRect(b.x, b.y, b.w, b.h));
+    outfield.forEach((b, i) => {
+      const team = teams[i];
+      ctx.strokeStyle = team === null || team === undefined ? "#94a3b8" : teamColour(team);
+      ctx.strokeRect(b.x, b.y, b.w, b.h);
+    });
+    ctx.strokeStyle = "#facc15";
+    det.goalkeepers.forEach((b) => ctx.strokeRect(b.x, b.y, b.w, b.h));
     if (det.ball) {
       ctx.strokeStyle = "#f43f5e";
       ctx.lineWidth = 3;
@@ -126,6 +142,23 @@ export default function Host() {
           const det = await detect(c);
           const now = performance.now();
 
+          // Both models share one wasm heap and corrupt it if run at once, so the heavy pitch model
+          // runs right after detection, about once a second.
+          if (now - pitch.current.t > PITCH_EVERY_MS) {
+            const t0 = performance.now();
+            pitch.current = { p: await locatePitch(c), t: now };
+            setStats((s) => ({ ...s, pitchMs: Math.round(performance.now() - t0) }));
+          }
+          // A pitch fit older than 1.5s is stale once the camera pans.
+          const fit = now - pitch.current.t < 1500 ? pitch.current.p : null;
+          const keeperSet = new Set(det.goalkeepers);
+          const outfield = det.players.filter((b) => !keeperSet.has(b));
+          const teams = splitter.current.assign(c, outfield);
+          const names: [string, string] = [`${colourName(0)} shirts`, `${colourName(1)} shirts`];
+          const r = game.current.update({ t: now, pitch: fit, players: outfield, teams, keepers: det.goalkeepers, ball: det.ball });
+          if (r) setRead({ r, names });
+          const gameHint = r ? describeRead(r, names) : "pitch not visible (close-up, replay or crowd shot)";
+
           // Keep the last few frames about 0.5s apart so Haiku sees motion, not one still.
           const last = ring.current.at(-1);
           if (!last || now - last.t >= RING_GAP_MS) {
@@ -137,7 +170,7 @@ export default function Host() {
             ring.current = [...ring.current, { t: now, c: snap }].slice(-RING_SIZE);
           }
           const t = trigger.current.update(c, det, now);
-          drawPreview(det);
+          drawPreview(det, teams, outfield);
           setStats((s) => ({
             ...s,
             players: det.players.length,
@@ -148,10 +181,19 @@ export default function Host() {
 
           if (t && !busy.current && ring.current.length) {
             busy.current = true;
-            const frames = ring.current.map(
-              (f) => f.c.toDataURL("image/jpeg", 0.6).split(",")[1],
-            );
-            processFrame({ frames, hint: t.hint })
+            // Older frames show motion at 640px. The newest is sent sharp, since players are tiny in wide shots.
+            const sharp = document.createElement("canvas");
+            const k = Math.min(1, 1280 / c.width);
+            sharp.width = Math.round(c.width * k);
+            sharp.height = Math.round(c.height * k);
+            sharp.getContext("2d")!.drawImage(c, 0, 0, sharp.width, sharp.height);
+            const frames = [
+              ...ring.current
+                .slice(1)
+                .map((f) => f.c.toDataURL("image/jpeg", 0.6).split(",")[1]),
+              sharp.toDataURL("image/jpeg", 0.85).split(",")[1],
+            ];
+            processFrame({ frames, hint: `${gameHint}; ${t.hint}` })
               .then((r) => {
                 setStats((s) => ({ ...s, last: `${r.event} (${t.reason})` }));
                 setLog((l) => [`${r.event}: ${r.note}`, ...l].slice(0, 6));
@@ -203,6 +245,12 @@ export default function Host() {
         >
           {capturing ? "Capturing" : "Start capture"}
         </button>
+        <button className="border rounded px-3" onClick={() => resetMatch()}>
+          Reset match
+        </button>
+        <button className="border rounded px-3" onClick={() => game.current.toggleDirection()}>
+          Flip direction
+        </button>
       </div>
       <p className="text-sm opacity-70">
         Press Start capture, choose &quot;This tab&quot;, then press play on the
@@ -224,9 +272,20 @@ export default function Host() {
           <canvas ref={preview} className="w-full bg-black" />
           <p className="text-sm font-mono">
             players {stats.players} | ball {stats.ball} | speed{" "}
-            {stats.speed.toFixed(2)} | cut {stats.cut.toFixed(0)} | last:{" "}
+            {stats.speed.toFixed(2)} | cut {stats.cut.toFixed(0)} | pitch {stats.pitchMs}ms | last:{" "}
             {stats.last}
           </p>
+          {read && (
+            <div className="text-sm font-mono space-y-1">
+              <div className="h-2 bg-neutral-800 rounded">
+                <div
+                  className="h-2 rounded bg-rose-500 transition-all"
+                  style={{ width: `${read.r.danger}%` }}
+                />
+              </div>
+              <p>{describeRead(read.r, read.names)}</p>
+            </div>
+          )}
         </div>
         <ul className="space-y-1">
           {log.map((l, i) => (

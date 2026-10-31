@@ -1,10 +1,11 @@
-import { action, internalMutation, internalQuery, query } from "./_generated/server";
+import { action, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import Anthropic from "@anthropic-ai/sdk";
 import { classify, textOf } from "./vision";
 
-const MODEL = "claude-haiku-5-5";
+const MODEL = "claude-haiku-5-5"; // writes the spoken line, where speed matters most
+const VISION_MODEL = "claude-sonnet-5-5"; // reads the frames; benched clearly better than Haiku for ~0.4s more
 const VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM";
 
 const PERSONA =
@@ -13,17 +14,46 @@ const PERSONA =
 // Big moments are always called. Minor ones only fill silence.
 const BIG = new Set(["goal", "shot", "save", "foul", "celebration"]);
 const QUIET_MS = 10000;
+const REPEAT_MS = 20000;
+
+const goals = (score: string) => score.split("-").reduce((a, b) => a + Number(b), 0);
 
 export const latest = query({
   args: {},
   handler: async (ctx) => ctx.db.query("lines").order("desc").take(10),
 });
 
-export const lastLineTime = internalQuery({
+// Starts a fresh match: forgets the score and clears the commentary feed. Samples are kept for the bench.
+export const resetMatch = mutation({
   args: {},
-  handler: async (ctx): Promise<number | null> => {
+  handler: async (ctx) => {
+    for await (const row of ctx.db.query("state")) await ctx.db.delete("state", row._id);
+    for await (const row of ctx.db.query("lines")) await ctx.db.delete("lines", row._id);
+  },
+});
+
+export const lastLine = internalQuery({
+  args: {},
+  handler: async (ctx): Promise<{ at: number; event: string } | null> => {
     const top = await ctx.db.query("lines").order("desc").first();
-    return top?._creationTime ?? null;
+    return top ? { at: top._creationTime, event: top.event } : null;
+  },
+});
+
+export const getState = internalQuery({
+  args: {},
+  handler: async (ctx): Promise<{ score: string | null; teams: string | null }> => {
+    const row = await ctx.db.query("state").first();
+    return { score: row?.score ?? null, teams: row?.teams ?? null };
+  },
+});
+
+export const setTeams = internalMutation({
+  args: { teams: v.string() },
+  handler: async (ctx, { teams }) => {
+    const row = await ctx.db.query("state").first();
+    if (row) await ctx.db.patch("state", row._id, { teams });
+    else await ctx.db.insert("state", { score: null, teams });
   },
 });
 
@@ -38,17 +68,12 @@ export const saveSample = internalMutation({
   },
 });
 
-// Stores the new score and returns the previous one.
 export const setScore = internalMutation({
   args: { score: v.string() },
-  handler: async (ctx, { score }): Promise<string | null> => {
+  handler: async (ctx, { score }) => {
     const row = await ctx.db.query("state").first();
-    if (!row) {
-      await ctx.db.insert("state", { score });
-      return null;
-    }
-    await ctx.db.patch("state", row._id, { score });
-    return row.score;
+    if (row) await ctx.db.patch("state", row._id, { score });
+    else await ctx.db.insert("state", { score });
   },
 });
 
@@ -71,7 +96,8 @@ export const processFrame = action({
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
     const t0 = Date.now();
-    const reading = await classify(client, MODEL, frames, hint);
+    const match = await ctx.runQuery(internal.booth.getState, {});
+    const reading = await classify(client, VISION_MODEL, frames, hint, match.teams);
     const ms = Date.now() - t0;
     let { event } = reading;
     const { note, score } = reading;
@@ -83,19 +109,31 @@ export const processFrame = action({
     await ctx.runMutation(internal.booth.saveSample, {
       frames: ids,
       hint,
-      live: { model: MODEL, event, note, score, ms },
+      live: { model: VISION_MODEL, event, note, score, ms },
     });
 
     // The scoreboard is the ground truth for goals, even when the goal itself was missed.
-    if (score) {
-      const prev: string | null = await ctx.runMutation(internal.booth.setScore, { score });
-      if (prev && prev !== score) event = "goal";
+    // A score that goes up by exactly one is a goal; anything else is a misread and is ignored.
+    if (!match.teams && reading.teams) await ctx.runMutation(internal.booth.setTeams, { teams: reading.teams });
+    const teams = match.teams ?? reading.teams;
+    const prev = match.score;
+    if (score && score !== prev) {
+      if (!prev || goals(score) === goals(prev) + 1) {
+        await ctx.runMutation(internal.booth.setScore, { score });
+        if (prev) event = "goal";
+      }
+    } else if (!score && prev && event === "goal") {
+      // The broadcaster hides the scoreboard during replays, so a "goal" without it is the replay.
+      event = "replay";
     }
 
     if (event === "none") return { event, note, score };
-    if (!BIG.has(event)) {
-      const last = await ctx.runQuery(internal.booth.lastLineTime, {});
-      if (last !== null && Date.now() - last < QUIET_MS) return { event, note, score };
+    const last = await ctx.runQuery(internal.booth.lastLine, {});
+    if (last) {
+      const age = Date.now() - last.at;
+      if (!BIG.has(event) && age < QUIET_MS) return { event, note, score };
+      // Sampling is continuous, so one celebration spans many reads. Call it once.
+      if (event !== "goal" && event === last.event && age < REPEAT_MS) return { event, note, score };
     }
 
     const speech = await client.messages.create({
@@ -106,7 +144,7 @@ export const processFrame = action({
       messages: [
         {
           role: "user",
-          content: `Event: ${event}. Detail: ${note}. Call it live.`,
+          content: `Match: ${teams ?? "unknown teams"}, score ${score ?? prev ?? "unknown"}. Event: ${event}. Detail: ${note}. Game state from tracking (may be wrong): ${hint ?? "unknown"}. Call it live; let the danger level set your intensity.`,
         },
       ],
     });

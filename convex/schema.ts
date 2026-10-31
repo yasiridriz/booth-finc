@@ -18,5 +18,6 @@ export default defineSchema({
   // Single row: what the match looks like right now.
   state: defineTable({
     score: v.union(v.string(), v.null()),
+    teams: v.optional(v.string()), // "Home (kit) vs Away (kit)", identified by the vision model
   }),
 });

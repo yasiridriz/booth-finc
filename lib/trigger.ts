@@ -4,8 +4,8 @@ import type { Detections } from "./detector";
 // fast ball motion, a scene cut (replay, goal close-up), and a slow heartbeat.
 export type Trigger = { reason: "ball-fast" | "scene-cut" | "heartbeat"; hint: string } | null;
 
-const COOLDOWN_MS = 2000;
-const HEARTBEAT_MS = 6000;
+const COOLDOWN_MS = 0; // the page already waits for the previous Haiku call to return
+const HEARTBEAT_MS = 0; // sample continuously: a 6s gap once swallowed a whole goal
 const BALL_SPEED = 0.6; // frame widths per second
 const CUT_DIFF = 40; // mean abs diff of a 32x18 grayscale thumb, 0-255
 
