@@ -28,6 +28,7 @@ export async function classify(
   frames: string[],
   hint: string | undefined,
   teams: string | null = null, // known once identified, so later calls skip the question
+  roster: string | null = null, // pasted lineup, used to turn shirt numbers into names
 ): Promise<Reading> {
   const res = await client.messages.create({
     model,
@@ -47,7 +48,7 @@ export async function classify(
           ]),
           {
             type: "text",
-            text: `These are football match frames about 0.5s apart, oldest first. Game state from player tracking (approximate, trust your eyes over it): ${hint ?? "none"}. Say what has just happened in the LAST frame. If the ball is in the net or players celebrate right after a shot, answer "goal". Use "replay" only for a slow-motion or different-angle replay, not for YouTube overlays or ordinary camera cuts. The note describes only what you see (who, where, which colour), never what did not happen. Read the scoreboard overlay if one is visible, as "home-away" digits like "0-1", else null. ${teams ? `The teams are ${teams}; use their names in the note.` : `Also identify the two teams if you can (scoreboard abbreviations, kits, badges) as "Home Name (kit colours) vs Away Name (kit colours)", else null.`} Reply with JSON only: {"event":${EVENTS.map((e) => `"${e}"`).join("|")},"note":"max 12 words","score":"0-1"|null${teams ? "" : `,"teams":string|null`}}`,
+            text: `These are football match frames about 0.5s apart, oldest first. Game state from player tracking (approximate, trust your eyes over it): ${hint ?? "none"}. Say what has just happened in the LAST frame. If the ball is in the net or players celebrate right after a shot, answer "goal". Use "replay" only for a slow-motion or different-angle replay, not for YouTube overlays or ordinary camera cuts. The note describes only what you see (who, where, which colour), never what did not happen. ${roster ? `Lineup (number and name per team):\n${roster}\nIf you can read a shirt number or an on-screen caption for the player involved in the LAST frame, start the note with that player's name from the lineup (for example "Mitrev shoots from the edge"). Name a player only when you can read the number or caption; otherwise describe the role and team. Never guess a name. ` : ""}Read the scoreboard overlay if one is visible, as "home-away" digits like "0-1", else null. ${teams ? `The teams are ${teams}; use their names in the note.` : `Also identify the two teams if you can (scoreboard abbreviations, kits, badges) as "Home Name (kit colours) vs Away Name (kit colours)", else null.`} Reply with JSON only: {"event":${EVENTS.map((e) => `"${e}"`).join("|")},"note":"max 12 words","score":"0-1"|null${teams ? "" : `,"teams":string|null`}}`,
           },
         ],
       },

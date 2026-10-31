@@ -10,6 +10,10 @@
 
 import type * as bench from "../bench.js";
 import type * as booth from "../booth.js";
+import type * as commentary from "../commentary.js";
+import type * as lineups from "../lineups.js";
+import type * as memory from "../memory.js";
+import type * as topics from "../topics.js";
 import type * as vision from "../vision.js";
 
 import type {
@@ -21,6 +25,10 @@ import type {
 declare const fullApi: ApiFromModules<{
   bench: typeof bench;
   booth: typeof booth;
+  commentary: typeof commentary;
+  lineups: typeof lineups;
+  memory: typeof memory;
+  topics: typeof topics;
   vision: typeof vision;
 }>;
 

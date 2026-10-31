@@ -1,15 +1,16 @@
-import { action, internalMutation, internalQuery, mutation, query } from "./_generated/server";
+import { action, internalAction, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import Anthropic from "@anthropic-ai/sdk";
 import { classify, textOf } from "./vision";
+import { synthesizeCommentary } from "../lib/commentaryVoice";
 
 const MODEL = "claude-haiku-5-5"; // writes the spoken line, where speed matters most
 const VISION_MODEL = "claude-sonnet-5-5"; // reads the frames; benched clearly better than Haiku for ~0.4s more
 const VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM";
 
 const PERSONA =
-  "You are a loud, passionate live football commentator. One short sentence, max 20 words. React to what you see. Never mention what did not happen (no 'no shot', 'no goal'). Vary your wording. No stage directions.";
+  "You are an electric, hyped-up live football commentator. One or two punchy calls, max 20 words. Always bring energy: even a simple pass crackles with anticipation, attacks build to a roar, saves and goals explode with disbelief and joy. Use exclamations, rhythm and vivid verbs, and vary them so no two calls sound alike. React only to the supplied observation; never invent teams, scores or outcomes. Name a player only if the observation already names them; never guess a name. Refer to a team by its name from the match line, not by shirt colour (the kit colours in the match line tell you which colour is which team). Never mention what did not happen (no 'no shot', 'no goal'). Vary your wording. No stage directions or audio tags; delivery is added separately.";
 
 // Big moments are always called. Minor ones only fill silence.
 const BIG = new Set(["goal", "shot", "save", "foul", "celebration"]);
@@ -17,6 +18,24 @@ const QUIET_MS = 10000;
 const REPEAT_MS = 20000;
 
 const goals = (score: string) => score.split("-").reduce((a, b) => a + Number(b), 0);
+
+// CLI-only smoke test: exercises synthesis and storage without faking match events.
+export const previewVoice = internalAction({
+  args: { event: v.union(v.literal("pass"), v.literal("save"), v.literal("goal")) },
+  returns: v.object({ audioUrl: v.string(), model: v.string(), voice: v.string(), ms: v.number() }),
+  handler: async (ctx, { event }) => {
+    const samples = {
+      pass: "A composed touch, and they work it patiently across the back.",
+      save: "Oh! What a save! He's clawed that out of the top corner!",
+      goal: "It's in! Oh, what a finish! That is absolutely unbelievable!",
+    };
+    const { audio, model, voice, ms } = await synthesizeCommentary(samples[event], event);
+    const id = await ctx.storage.store(audio);
+    const audioUrl = await ctx.storage.getUrl(id);
+    if (!audioUrl) throw new Error("Could not retrieve the commentary audio");
+    return { audioUrl, model, voice, ms };
+  },
+});
 
 export const latest = query({
   args: {},
@@ -27,8 +46,10 @@ export const latest = query({
 export const resetMatch = mutation({
   args: {},
   handler: async (ctx) => {
-    for await (const row of ctx.db.query("state")) await ctx.db.delete("state", row._id);
+    // Keep the pasted roster; forget the score and teams.
+    for await (const row of ctx.db.query("state")) await ctx.db.patch("state", row._id, { score: null, teams: undefined });
     for await (const row of ctx.db.query("lines")) await ctx.db.delete("lines", row._id);
+    for await (const row of ctx.db.query("memory")) await ctx.db.delete("memory", row._id);
   },
 });
 
@@ -42,9 +63,23 @@ export const lastLine = internalQuery({
 
 export const getState = internalQuery({
   args: {},
-  handler: async (ctx): Promise<{ score: string | null; teams: string | null }> => {
+  handler: async (ctx): Promise<{ score: string | null; teams: string | null; roster: string | null }> => {
     const row = await ctx.db.query("state").first();
-    return { score: row?.score ?? null, teams: row?.teams ?? null };
+    return { score: row?.score ?? null, teams: row?.teams ?? null, roster: row?.roster ?? null };
+  },
+});
+
+export const roster = query({
+  args: {},
+  handler: async (ctx) => (await ctx.db.query("state").first())?.roster ?? "",
+});
+
+export const setRoster = mutation({
+  args: { roster: v.string() },
+  handler: async (ctx, { roster }) => {
+    const row = await ctx.db.query("state").first();
+    if (row) await ctx.db.patch("state", row._id, { roster });
+    else await ctx.db.insert("state", { score: null, roster });
   },
 });
 
@@ -83,6 +118,8 @@ export const insertLine = internalMutation({
     event: v.string(),
     text: v.string(),
     audioUrl: v.optional(v.string()),
+    priority: v.optional(v.number()),
+    ttlMs: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     await ctx.db.insert("lines", args);
@@ -92,12 +129,13 @@ export const insertLine = internalMutation({
 // One frame in, at most one spoken line out.
 export const processFrame = action({
   args: { frames: v.array(v.string()), hint: v.optional(v.string()) }, // base64 JPEGs, oldest first, no data: prefix
+  returns: v.object({ event: v.string(), note: v.string(), score: v.union(v.string(), v.null()) }),
   handler: async (ctx, { frames, hint }): Promise<{ event: string; note: string; score: string | null }> => {
-    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_KEY });
 
     const t0 = Date.now();
     const match = await ctx.runQuery(internal.booth.getState, {});
-    const reading = await classify(client, VISION_MODEL, frames, hint, match.teams);
+    const reading = await classify(client, VISION_MODEL, frames, hint, match.teams, match.roster);
     const ms = Date.now() - t0;
     let { event } = reading;
     const { note, score } = reading;
@@ -136,6 +174,7 @@ export const processFrame = action({
       if (event !== "goal" && event === last.event && age < REPEAT_MS) return { event, note, score };
     }
 
+    const earlier: string[] = await ctx.runQuery(internal.memory.recent, {});
     const speech = await client.messages.create({
       model: MODEL,
       max_tokens: 120,
@@ -144,36 +183,27 @@ export const processFrame = action({
       messages: [
         {
           role: "user",
-          content: `Match: ${teams ?? "unknown teams"}, score ${score ?? prev ?? "unknown"}. Event: ${event}. Detail: ${note}. Game state from tracking (may be wrong): ${hint ?? "unknown"}. Call it live; let the danger level set your intensity.`,
+          content: `Match: ${teams ?? "unknown teams"}, score ${score ?? prev ?? "unknown"}. ${earlier.length ? `Earlier in this match (use for a storyline only when it truly connects): ${earlier.join("; ")}. ` : ""}Event: ${event}. Detail: ${note}. ${match.roster ? `Lineup: ${match.roster.replace(/\n+/g, "; ")}. ` : ""}Game state from tracking (may be wrong; its shirt colours are not team names): ${hint ?? "unknown"}. Call it live; let the danger level set your intensity.`,
         },
       ],
     });
     const text = textOf(speech.content);
 
-    let audioUrl: string | undefined;
-    const tts = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": process.env.ELEVENLABS_API_KEY!,
-          "Content-Type": "application/json",
-          Accept: "audio/mpeg",
-        },
-        body: JSON.stringify({ text, model_id: "eleven_multilingual_v2" }),
-      },
-    );
-    if (tts.ok) {
-      const id = await ctx.storage.store(await tts.blob());
-      audioUrl = (await ctx.storage.getUrl(id)) ?? undefined;
-    }
+    const speechAudio = await synthesizeCommentary(text, event);
+    const audioId = await ctx.storage.store(speechAudio.audio);
+    const audioUrl = (await ctx.storage.getUrl(audioId)) ?? undefined;
 
     await ctx.runMutation(internal.booth.insertLine, {
       persona: "commentator",
       event,
       text,
       audioUrl,
+      priority: 3,
+      ttlMs: 9000,
     });
+    if (event === "goal" || event === "shot" || event === "save" || event === "foul") {
+      await ctx.runMutation(internal.memory.record, { kind: event, text: score ? `${note} (score ${score})` : note });
+    }
     return { event, note, score };
   },
 });

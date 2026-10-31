@@ -12,6 +12,7 @@
 
 # testing
 /coverage
+/artifacts/voice-demo/
 
 # next.js
 /.next/
@@ -42,3 +43,4 @@ next-env.d.ts
 
 # 172MB pitch model, over GitHub's file limit
 public/models/pitch.onnx
+public/clips/
