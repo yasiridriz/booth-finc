@@ -7,6 +7,7 @@ import { synthesizeCommentary } from "../lib/commentaryVoice";
 import { DEFAULT_LANG, DEFAULT_STYLE, STYLES, isLang, isStyle, personaPrompt, type Lang, type StyleId } from "./personas";
 
 const MODEL = "claude-haiku-5-5"; // writes the spoken line, where speed matters most
+const LIVE_VOICE_MODEL = "eleven_flash_v2_5";
 const VISION_MODEL = "claude-sonnet-5-5"; // reads the frames; benched clearly better than Haiku for ~0.4s more
 const VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM";
 
@@ -179,20 +180,29 @@ export const processFrame = action({
 
     const t0 = Date.now();
     const match = await ctx.runQuery(internal.booth.getState, {});
-    const reading = await classify(client, VISION_MODEL, frames, hint, match.teams, match.roster);
+    const earlier: string[] = await ctx.runQuery(internal.memory.recent, {});
+    // The vision call also writes the spoken line, so a call needs one model round trip, not two.
+    const speak = {
+      system: `${personaPrompt(match.style, match.lang)}\n\nRules: ${PERSONA}`,
+      context: `Match: ${match.teams ?? "teams as identified above"}, score ${match.score ?? "as on the scoreboard"}. ${earlier.length ? `Earlier in this match (use for a storyline only when it truly connects): ${earlier.join("; ")}. ` : ""}Let the danger level in the game state set your intensity.`,
+    };
+    const reading = await classify(client, VISION_MODEL, frames, hint, match.teams, match.roster, speak);
     const ms = Date.now() - t0;
     let { event } = reading;
     const { note, score } = reading;
 
-    // Keep every frame set for the bench. Runs after the reply is known so it adds no latency to the read.
-    const ids = await Promise.all(
-      frames.map((f) => ctx.storage.store(new Blob([Uint8Array.from(atob(f), (c) => c.charCodeAt(0))], { type: "image/jpeg" }))),
-    );
-    await ctx.runMutation(internal.booth.saveSample, {
-      frames: ids,
-      hint,
-      live: { model: VISION_MODEL, event, note, score, ms },
-    });
+    // Keep every frame set for the bench. Called on every exit after the line is made, so it never delays a call.
+    const saveSample = async () => {
+      const ids = await Promise.all(
+        frames.map((f) => ctx.storage.store(new Blob([Uint8Array.from(atob(f), (c) => c.charCodeAt(0))], { type: "image/jpeg" }))),
+      );
+      await ctx.runMutation(internal.booth.saveSample, {
+        frames: ids,
+        hint,
+        live: { model: VISION_MODEL, event: reading.event, note, score, ms },
+      });
+    };
+
 
     // The scoreboard is the ground truth for goals, even when the goal itself was missed.
     // A score that goes up by exactly one is a goal; anything else is a misread and is ignored.
@@ -209,31 +219,44 @@ export const processFrame = action({
       event = "replay";
     }
 
-    if (event === "none") return { event, note, score };
+    if (event === "none") {
+      await saveSample();
+      return { event, note, score };
+    }
     const last = await ctx.runQuery(internal.booth.lastLine, {});
     if (last) {
       const age = Date.now() - last.at;
-      if (!BIG.has(event) && age < QUIET_MS) return { event, note, score };
+      if (!BIG.has(event) && age < QUIET_MS) {
+        await saveSample();
+        return { event, note, score };
+      }
       // Sampling is continuous, so one celebration spans many reads. Call it once.
-      if (event !== "goal" && event === last.event && age < REPEAT_MS) return { event, note, score };
+      if (event !== "goal" && event === last.event && age < REPEAT_MS) {
+        await saveSample();
+        return { event, note, score };
+      }
     }
 
-    const earlier: string[] = await ctx.runQuery(internal.memory.recent, {});
-    const speech = await client.messages.create({
-      model: MODEL,
-      max_tokens: 120,
-      thinking: { type: "disabled" },
-      system: `${personaPrompt(match.style, match.lang)}\n\nRules: ${PERSONA}`,
-      messages: [
-        {
-          role: "user",
-          content: `Match: ${teams ?? "unknown teams"}, score ${score ?? prev ?? "unknown"}. ${earlier.length ? `Earlier in this match (use for a storyline only when it truly connects): ${earlier.join("; ")}. ` : ""}Event: ${event}. Detail: ${note}. ${match.roster ? `Lineup: ${match.roster.replace(/\n+/g, "; ")}. ` : ""}Game state from tracking (may be wrong; its shirt colours are not team names): ${hint ?? "unknown"}. Call it live; let the danger level set your intensity.`,
-        },
-      ],
-    });
-    const text = textOf(speech.content);
+    // Use the line written with the frames, unless the event changed after the read (a score change made it a goal).
+    let text = event === reading.event ? reading.line : "";
+    if (!text) {
+      const speech = await client.messages.create({
+        model: MODEL,
+        max_tokens: 120,
+        thinking: { type: "disabled" },
+        system: speak.system,
+        messages: [
+          {
+            role: "user",
+            content: `${speak.context} Event: ${event}. Detail: ${note}. ${match.roster ? `Lineup: ${match.roster.replace(/\n+/g, "; ")}. ` : ""}Game state from tracking (may be wrong; its shirt colours are not team names): ${hint ?? "unknown"}. Call it live.`,
+          },
+        ],
+      });
+      text = textOf(speech.content);
+    }
 
-    const speechAudio = await synthesizeCommentary(text, event, STYLES.find((s) => s.id === match.style)?.voiceId);
+    // Live calls use the low-latency voice model (about 0.4s against 1.1s); the energy comes from the words.
+    const speechAudio = await synthesizeCommentary(text, event, STYLES.find((s) => s.id === match.style)?.voiceId, LIVE_VOICE_MODEL);
     const audioId = await ctx.storage.store(speechAudio.audio);
     const audioUrl = (await ctx.storage.getUrl(audioId)) ?? undefined;
 
@@ -250,6 +273,7 @@ export const processFrame = action({
     if (event === "goal" || event === "shot" || event === "save" || event === "foul") {
       await ctx.runMutation(internal.memory.record, { kind: event, text: score ? `${note} (score ${score})` : note });
     }
+    await saveSample();
     return { event, note, score };
   },
 });

@@ -121,9 +121,9 @@ The aim is no dead air, without overlapping or repeating.
   restart) and serves byte ranges of what has arrived. YouTube refuses plain fetches of its stream URLs, so yt-dlp must do the download.
 - **Jump-ahead.** Seeking past the downloaded part switches the source to `&from=<seconds>`: a second yt-dlp run with
   `--download-sections` writing fragmented mp4, streamed as it grows. About 20 s to start. "Back to full match" returns.
-- **Broadcast delay.** A hidden analysis `<video>` runs `DELAY_S` (7 s) ahead of the one the viewer watches. Event lines carry `vt`
+- **Broadcast delay.** A hidden analysis `<video>` runs `DELAY_S` (4 s) ahead of the one the viewer watches. Event lines carry `vt`
   (the video time they describe) and `madeMs`; the page plays a timed line when the viewer reaches `vt`, drops it 2.5 s late, and holds
-  fillers when a timed call is due. Calls measured at 5.0-6.4 s to make (vision ~2.5 s, Haiku, ElevenLabs ~2.5 s).
+  fillers when a timed call is due. Calls take 2.4-2.9 s: one Sonnet call reads the frames and writes the line (~2 s), and live calls use the eleven_flash_v2_5 voice (~0.4 s). Fillers keep the more expressive default voice model.
 - **Styles and languages.** `convex/personas.ts`: 6 styles (hype, tactician, conspiracy, grandpa, poet, ultra), each with its own
   ElevenLabs voice, x English/French. Stored in `state.style` / `state.lang` via `booth.setPersona`; both survive "Reset match".
   Event calls and gap lines put the persona prompt first. Reset match also clears talking points (they belong to the last match's clubs).

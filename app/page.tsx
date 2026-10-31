@@ -23,7 +23,7 @@ const DETECT_FPS = 5;
 const RING_SIZE = 4;
 const RING_GAP_MS = 500;
 const PITCH_EVERY_MS = 1000;
-const DELAY_S = 7; // broadcast delay: analysis runs this far ahead; calls measured at 5.0-6.4s to make
+const DELAY_S = 4; // broadcast delay: analysis runs this far ahead; calls measured at 2.4-2.9s to make
 const EARLY_S = 0.2; // a timed line may start this much before its moment
 const LATE_S = 2.5; // a timed line this late is stale and dropped
 
